@@ -2,7 +2,7 @@
 
 ## Context
 
-사용자가 vue-board-study 프로젝트의 소스 코드를 분석하면서 Vue 구조를 체계적으로 학습하고자 합니다. 이 프로젝트는 Vue 3 Composition API, Pinia 상태 관리, Vue Router를 사용한 게시판 CRUD 애플리케이션입니다. 수정 test
+사용자가 vue-board-study 프로젝트의 소스 코드를 분석하면서 Vue 구조를 체계적으로 학습하고자 합니다. 이 프로젝트는 Vue 3 Composition API, Pinia 상태 관리, Vue Router를 사용한 게시판 CRUD 애플리케이션입니다. 수정 testtest1
 
 ## 추천 학습 순서
 
