@@ -1,6 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import HomeView from '../views/HomeView.vue'
-import BoardListView from '../views/BoardListView.vue'
+import BoardListView from '../views/BoardListView.vue' // 주석1
 import BoardDetailView from '../views/BoardDetailView.vue'
 import BoardCreateView from '../views/BoardCreateView.vue'
 import BoardEditView from '../views/BoardEditView.vue'
