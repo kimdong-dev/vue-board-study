@@ -12,4 +12,4 @@ app.use(createPinia())
 app.use(router)
 
 app.mount('#app')
-// 수정1
+// 수정2
