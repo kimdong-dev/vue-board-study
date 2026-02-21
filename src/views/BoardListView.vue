@@ -1,4 +1,4 @@
-<template>
+<template><!--커밋1-->
   <div>
     <div class="flex justify-between items-center mb-8">
       <h1 class="text-3xl font-bold text-gray-800">게시판</h1>
