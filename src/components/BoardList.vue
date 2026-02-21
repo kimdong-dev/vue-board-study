@@ -1,5 +1,5 @@
 <template>
-  <div><!-- 주석 dev--><!--또 수정-->
+  <div>
     <div class="mb-6">
       <input
         v-model="searchKeyword"
