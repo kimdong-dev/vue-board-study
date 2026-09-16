@@ -1,114 +1,310 @@
--- ============================================================
--- EEP 설계진도 Risk Warning 알림 발송 로그 (마스터)
--- 수신자 1명 = 메일 1통 = 1행
--- ============================================================
-CREATE TABLE BTA_EP_E_PRI_NOTI_LOG (
-    LOG_SEQ          NUMBER          NOT NULL,
-    BATCH_DT         VARCHAR2(8)     NOT NULL,
-    RCVR_EMPNO       VARCHAR2(20)    NOT NULL,
-    RCVR_NM          VARCHAR2(100),
-    RCVR_GBN         VARCHAR2(20),
-    RCVR_DEPT_NM     VARCHAR2(200),
-    RCVR_DISPLN_CD   VARCHAR2(100),
-    RCVR_DISPLN_NM   VARCHAR2(300),
-    MAIL_TYPE        VARCHAR2(20)    NOT NULL,
-    MAIL_LANG        VARCHAR2(2),
-    PJT_CNT          NUMBER(5),
-    ITEM_CNT         NUMBER(5),
-    IMMD_CNT         NUMBER(5),
-    RCVY_CNT         NUMBER(5),
-    ERLY_CNT         NUMBER(5),
-    MAIL_TITLE       VARCHAR2(2000),
-    MAIL_BODY        CLOB,
-    SEND_YN          CHAR(1)         DEFAULT 'N',
-    SEND_DT          DATE,
-    REG_DT           DATE            DEFAULT SYSDATE,
-    CONSTRAINT PK_BTA_EP_E_PRI_NOTI_LOG PRIMARY KEY (LOG_SEQ)
-);
+package com.secl.pms.batch.vo;
 
-CREATE INDEX IX_BTA_EP_E_PRI_NOTI_LOG_01
-    ON BTA_EP_E_PRI_NOTI_LOG (BATCH_DT, RCVR_EMPNO);
+import java.util.Comparator;
+import java.util.Map;
 
-COMMENT ON TABLE  BTA_EP_E_PRI_NOTI_LOG IS 'EEP 설계진도 Risk Warning 알림 발송 로그(메일 단위)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.LOG_SEQ        IS '로그순번 (MAX+1 채번)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.BATCH_DT       IS '배치 기준일 YYYYMMDD';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.RCVR_EMPNO     IS '수신자 사번';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.RCVR_NM        IS '수신자 성명';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.RCVR_GBN       IS '수신자구분 LE/GROUP_MANAGER/TEAM_MANAGER';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.RCVR_DEPT_NM   IS '수신자 부서명';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.RCVR_DISPLN_CD IS '수신자 공종코드(복수시 콤마)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.RCVR_DISPLN_NM IS '수신자 공종명(복수시 슬래시)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.MAIL_TYPE      IS '메일유형 ITEM:관리항목단건, KEYTASK:KeyTask단건, DIGEST:단일PJT다이제스트, MULTI:복수PJT다이제스트';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.MAIL_LANG      IS '메일언어 KR/EN';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.PJT_CNT        IS '대상 프로젝트 수(M)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.ITEM_CNT       IS '대상 항목 수(N)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.IMMD_CNT       IS '즉시조치 건수(D-1, D-2)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.RCVY_CNT       IS '만회조치 건수(D-4, D-3)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.ERLY_CNT       IS '조기점검 건수(D-6, D-5)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.MAIL_TITLE     IS '메일제목';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.MAIL_BODY      IS '메일본문(HTML)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.SEND_YN        IS '실발송여부 (검증단계에서는 N)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.SEND_DT        IS '실발송일시';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG.REG_DT         IS '등록일시';
+/**
+ * EEP 설계진도 Risk Warning 알림 대상 항목 VO
+ * Processor 조회 결과 1행 + OWNER_GBN(KEYTASK/ITEM) 조합으로 생성
+ */
+public class EepAlertItemVo {
 
--- ============================================================
--- EEP 알림 발송 로그 상세 (메일 표에 들어간 항목)
--- ============================================================
-CREATE TABLE BTA_EP_E_PRI_NOTI_LOG_DTL (
-    LOG_SEQ             NUMBER          NOT NULL,
-    ITEM_NO             NUMBER(5)       NOT NULL,
-    PJT_NO              VARCHAR2(20),
-    V_ORDER             VARCHAR2(20),
-    PRI_SEQ             NUMBER,
-    MNG_ITEM_NO         VARCHAR2(50),
-    PRI_MNG_ITEM_NM     VARCHAR2(1000),
-    MST_DISPLN_CD       VARCHAR2(10),
-    MST_DISPLN_NM       VARCHAR2(100),
-    PRI_DTL_SEQ         NUMBER,
-    DTL_MNG_ITEM_NO     VARCHAR2(50),
-    PRI_MNG_ITEM_SUB_NM VARCHAR2(1000),
-    MAJ_DISPLN_CD       VARCHAR2(10),
-    DISPLN_NM           VARCHAR2(100),
-    OWNER_GBN           VARCHAR2(10),
-    PLAN_DT             VARCHAR2(8),
-    WEEKS_BEFORE        NUMBER(2),
-    VER                 VARCHAR2(2),
-    DSN_COMP            NUMBER(7,2),
-    COMP_LIMIT          NUMBER(5),
-    ACTION_LVL          VARCHAR2(10),
-    STAGE_NM            VARCHAR2(50),
-    STATUS_NM           VARCHAR2(200),
-    ACTION_NM           VARCHAR2(300),
-    CONSTRAINT PK_BTA_EP_E_PRI_NOTI_LOG_DTL PRIMARY KEY (LOG_SEQ, ITEM_NO)
-);
+    /* ===== 구분값 상수 ===== */
+    public static final String GBN_KEYTASK = "KEYTASK";
+    public static final String GBN_ITEM    = "ITEM";
 
-CREATE INDEX IX_BTA_EP_E_PRI_NOTI_LOG_DTL_01
-    ON BTA_EP_E_PRI_NOTI_LOG_DTL (PJT_NO, PRI_SEQ, PRI_DTL_SEQ);
+    public static final String LVL_IMMD = "IMMD"; // 즉시조치 (D-1, D-2)
+    public static final String LVL_RCVY = "RCVY"; // 만회조치 (D-4, D-3)
+    public static final String LVL_ERLY = "ERLY"; // 조기점검 (D-6, D-5)
 
-COMMENT ON TABLE  BTA_EP_E_PRI_NOTI_LOG_DTL IS 'EEP 알림 발송 로그 - 대상 항목';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.LOG_SEQ             IS '로그순번(마스터 FK)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.ITEM_NO             IS '표 내 순번(정렬 적용 후)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.PJT_NO              IS '프로젝트번호';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.V_ORDER             IS '프로젝트 표기명';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.PRI_SEQ             IS '관리항목 마스터 순번';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.MNG_ITEM_NO         IS '관리항목번호(MST)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.PRI_MNG_ITEM_NM     IS 'Key Task명';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.MST_DISPLN_CD       IS 'Key Task 공종코드(J0은 J1/J2로 확장됨)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.MST_DISPLN_NM       IS 'Key Task 공종명';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.PRI_DTL_SEQ         IS '상세관리항목 순번';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.DTL_MNG_ITEM_NO     IS '관리항목번호(DTL)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.PRI_MNG_ITEM_SUB_NM IS '관리항목명';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.MAJ_DISPLN_CD       IS '관리항목 공종코드(J0은 J1/J2로 확장됨)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.DISPLN_NM           IS '관리항목 공종명';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.OWNER_GBN           IS '구분 KEYTASK:Key Task, ITEM:관리항목';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.PLAN_DT             IS 'Key Task 완료예정일';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.WEEKS_BEFORE        IS 'N주 전 (1,2,3,4,5,6)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.VER                 IS 'D-1주 버전 V1/V2, 그 외 -';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.DSN_COMP            IS '완성도(OWNER_GBN에 해당하는 값)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.COMP_LIMIT          IS '임계값(%)';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.ACTION_LVL          IS '조치수준 IMMD:즉시조치, RCVY:만회조치, ERLY:조기점검';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.STAGE_NM            IS '표기용 단계 (예: D-1주 (V1))';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.STATUS_NM           IS '표기용 상태';
-COMMENT ON COLUMN BTA_EP_E_PRI_NOTI_LOG_DTL.ACTION_NM           IS '표기용 필요조치';
+    /* ===== Processor 조회 결과 ===== */
+    private String pjtNo;
+    private String vOrder;
+    private String priSeq;
+    private String priDtlSeq;
+    private String mngItemNo;           // 관리항목번호 (MST)
+    private String priMngItemNm;        // Key Task명
+    private String priMngItemSubNm;     // 관리항목명
+    private String planDt;
+    private String mstDisplnCd;
+    private String mstDisplnNm;
+    private String majDisplnCd;
+    private String displnNm;
+    private String mstDsnComp;
+    private String dsnComp;
+    private int    weeksBefore;
+    private int    compLimit;
+    private String ver;                 // V1 / V2 / -
+    private String mstUnderYn;
+    private String dtlUnderYn;
 
+    /* ===== Writer 파생 ===== */
+    private String ownerGbn;            // KEYTASK / ITEM
+    private String actionLvl;           // IMMD / RCVY / ERLY
+    private int    sortLvl;             // 1=D-1V1, 2=D-1V2, 3=D-2, 4=D-4/3, 5=D-6/5
 
+    /* ===== 팩토리 ===== */
+    public static EepAlertItemVo create(Map<String, Object> row, String ownerGbn) {
+        EepAlertItemVo vo = new EepAlertItemVo();
+
+        vo.pjtNo            = str(row.get("pjtNo"));
+        vo.vOrder           = str(row.get("vOrder"));
+        vo.priSeq           = str(row.get("priSeq"));
+        vo.priDtlSeq        = str(row.get("priDtlSeq"));
+        vo.mngItemNo        = str(row.get("mngItemNo"));
+        vo.priMngItemNm     = str(row.get("priMngItemNm"));
+        vo.priMngItemSubNm  = str(row.get("priMngItemSubNm"));
+        vo.planDt           = str(row.get("planDt"));
+        vo.mstDisplnCd      = str(row.get("mstDisplnCd"));
+        vo.mstDisplnNm      = str(row.get("mstDisplnNm"));
+        vo.majDisplnCd      = str(row.get("majDisplnCd"));
+        vo.displnNm         = str(row.get("displnNm"));
+        vo.mstDsnComp       = str(row.get("mstDsnComp"));
+        vo.dsnComp          = str(row.get("dsnComp"));
+        vo.weeksBefore      = num(row.get("weeksBefore"));
+        vo.compLimit        = num(row.get("compLimit"));
+        vo.ver              = str(row.get("ver"));
+        vo.mstUnderYn       = str(row.get("mstUnderYn"));
+        vo.dtlUnderYn       = str(row.get("dtlUnderYn"));
+
+        vo.ownerGbn = ownerGbn;
+        vo.applyDerived();
+        return vo;
+    }
+
+    private void applyDerived() {
+        if (weeksBefore <= 2) {
+            actionLvl = LVL_IMMD;
+        } else if (weeksBefore <= 4) {
+            actionLvl = LVL_RCVY;
+        } else {
+            actionLvl = LVL_ERLY;
+        }
+
+        if (weeksBefore == 1) {
+            sortLvl = "V2".equals(ver) ? 2 : 1;
+        } else if (weeksBefore == 2) {
+            sortLvl = 3;
+        } else if (weeksBefore == 3 || weeksBefore == 4) {
+            sortLvl = 4;
+        } else {
+            sortLvl = 5;
+        }
+    }
+
+    /* ===== 구분별 표시값 ===== */
+    public boolean isKeyTask() {
+        return GBN_KEYTASK.equals(ownerGbn);
+    }
+
+    /** 표 '구분' 컬럼 */
+    public String getTypeNm() {
+        return isKeyTask() ? "Key Task" : "관리항목";
+    }
+
+    /** 표 '명칭' 컬럼 */
+    public String getViewName() {
+        return isKeyTask() ? priMngItemNm : priMngItemSubNm;
+    }
+
+    /** 표 '관련 Key Task' 컬럼 (Key Task 건이면 '-') */
+    public String getViewKeyTask() {
+        return isKeyTask() ? "-" : priMngItemNm;
+    }
+
+    /** 해당 건의 완성도 */
+    public String getViewComp() {
+        return isKeyTask() ? mstDsnComp : dsnComp;
+    }
+
+    /** 해당 건의 공종코드 */
+    public String getViewDisplnCd() {
+        return isKeyTask() ? mstDisplnCd : majDisplnCd;
+    }
+
+    /** 해당 건의 공종명 */
+    public String getViewDisplnNm() {
+        return isKeyTask() ? mstDisplnNm : displnNm;
+    }
+
+    /** 미달여부 */
+    public boolean isUnder() {
+        return isKeyTask() ? "Y".equals(mstUnderYn) : "Y".equals(dtlUnderYn);
+    }
+
+    /* ===== 표기용 문구 ===== */
+
+    /** 단계: "D-1주 (V1)" / "D-2주" */
+    public String getStageNm() {
+        if (weeksBefore == 1) {
+            return "D-1주 (" + ("V2".equals(ver) ? "V2" : "V1") + ")";
+        }
+        return "D-" + weeksBefore + "주";
+    }
+
+    /** 상태 */
+    public String getStatusNm() {
+        if (isKeyTask()) {
+            if (weeksBefore <= 2) {
+                return "즉시 조치 필요";
+            } else if (weeksBefore <= 4) {
+                return "만회 조치 필요";
+            }
+            return "조기 점검 필요";
+        }
+
+        if (weeksBefore == 1) {
+            return "V2".equals(ver) ? "진행율 저조 - 완료 전 최종 점검" : "진행율 저조 - 품질·일정 리스크";
+        } else if (weeksBefore == 2) {
+            return "진행율 저조 - 즉시 조치 필요";
+        } else if (weeksBefore <= 4) {
+            return "진행율 저조 지속 - 만회 조치 필요";
+        }
+        return "진행율 저조 - 조기 점검 필요";
+    }
+
+    /** 필요 조치 */
+    public String getActionNm() {
+        if (isKeyTask()) {
+            if (weeksBefore <= 2) {
+                return "즉시 검토 및 조치, 관련 담당자 협의 필수";
+            } else if (weeksBefore <= 4) {
+                return "지체 없이 완료 조치, LE와 협의";
+            }
+            return "하위 관리항목 조기 점검";
+        }
+
+        if (weeksBefore <= 2) {
+            return "즉시 완료 조치, 프로젝트 LE 협의 필수";
+        } else if (weeksBefore <= 4) {
+            return "지체 없이 완료 조치, LE와 협의";
+        }
+        return "조기 점검 및 완료 조치";
+    }
+
+    /* ===== 그룹핑/중복제거 키 ===== */
+    /**
+     * Key Task 건은 상세 단위가 아니므로 priDtlSeq를 제외한다.
+     * (제외하지 않으면 하위 상세 개수만큼 같은 Key Task가 중복됨)
+     */
+    public String getItemKey() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(pjtNo).append("|").append(priSeq).append("|");
+        if (isKeyTask()) {
+            sb.append("MST");
+        } else {
+            sb.append(priDtlSeq);
+        }
+        sb.append("|").append(ownerGbn);
+        sb.append("|").append(weeksBefore);
+        sb.append("|").append(ver);
+        return sb.toString();
+    }
+
+    /* ===== 정렬: 단계 우선, 동일단계면 Key Task 우선 ===== */
+    public static final Comparator<EepAlertItemVo> SORT = new Comparator<EepAlertItemVo>() {
+        public int compare(EepAlertItemVo a, EepAlertItemVo b) {
+            if (a.sortLvl != b.sortLvl) {
+                return a.sortLvl - b.sortLvl;
+            }
+            int ga = a.isKeyTask() ? 0 : 1;
+            int gb = b.isKeyTask() ? 0 : 1;
+            if (ga != gb) {
+                return ga - gb;
+            }
+            return nvl(a.getViewName()).compareTo(nvl(b.getViewName()));
+        }
+    };
+
+    /* ===== util ===== */
+    private static String str(Object o) {
+        return o == null ? "" : String.valueOf(o);
+    }
+
+    private static int num(Object o) {
+        if (o == null) {
+            return 0;
+        }
+        try {
+            String s = String.valueOf(o).trim();
+            int dot = s.indexOf('.');
+            if (dot > -1) {
+                s = s.substring(0, dot);
+            }
+            return Integer.parseInt(s);
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private static String nvl(String s) {
+        return s == null ? "" : s;
+    }
+
+    /* ===== getter / setter ===== */
+    public String getPjtNo() { return pjtNo; }
+    public void setPjtNo(String pjtNo) { this.pjtNo = pjtNo; }
+
+    public String getVOrder() { return vOrder; }
+    public void setVOrder(String vOrder) { this.vOrder = vOrder; }
+
+    public String getPriSeq() { return priSeq; }
+    public void setPriSeq(String priSeq) { this.priSeq = priSeq; }
+
+    public String getPriDtlSeq() { return priDtlSeq; }
+    public void setPriDtlSeq(String priDtlSeq) { this.priDtlSeq = priDtlSeq; }
+
+    public String getMngItemNo() { return mngItemNo; }
+    public void setMngItemNo(String mngItemNo) { this.mngItemNo = mngItemNo; }
+
+    public String getPriMngItemNm() { return priMngItemNm; }
+    public void setPriMngItemNm(String priMngItemNm) { this.priMngItemNm = priMngItemNm; }
+
+    public String getPriMngItemSubNm() { return priMngItemSubNm; }
+    public void setPriMngItemSubNm(String priMngItemSubNm) { this.priMngItemSubNm = priMngItemSubNm; }
+
+    public String getPlanDt() { return planDt; }
+    public void setPlanDt(String planDt) { this.planDt = planDt; }
+
+    public String getMstDisplnCd() { return mstDisplnCd; }
+    public void setMstDisplnCd(String mstDisplnCd) { this.mstDisplnCd = mstDisplnCd; }
+
+    public String getMstDisplnNm() { return mstDisplnNm; }
+    public void setMstDisplnNm(String mstDisplnNm) { this.mstDisplnNm = mstDisplnNm; }
+
+    public String getMajDisplnCd() { return majDisplnCd; }
+    public void setMajDisplnCd(String majDisplnCd) { this.majDisplnCd = majDisplnCd; }
+
+    public String getDisplnNm() { return displnNm; }
+    public void setDisplnNm(String displnNm) { this.displnNm = displnNm; }
+
+    public String getMstDsnComp() { return mstDsnComp; }
+    public void setMstDsnComp(String mstDsnComp) { this.mstDsnComp = mstDsnComp; }
+
+    public String getDsnComp() { return dsnComp; }
+    public void setDsnComp(String dsnComp) { this.dsnComp = dsnComp; }
+
+    public int getWeeksBefore() { return weeksBefore; }
+    public void setWeeksBefore(int weeksBefore) { this.weeksBefore = weeksBefore; }
+
+    public int getCompLimit() { return compLimit; }
+    public void setCompLimit(int compLimit) { this.compLimit = compLimit; }
+
+    public String getVer() { return ver; }
+    public void setVer(String ver) { this.ver = ver; }
+
+    public String getMstUnderYn() { return mstUnderYn; }
+    public void setMstUnderYn(String mstUnderYn) { this.mstUnderYn = mstUnderYn; }
+
+    public String getDtlUnderYn() { return dtlUnderYn; }
+    public void setDtlUnderYn(String dtlUnderYn) { this.dtlUnderYn = dtlUnderYn; }
+
+    public String getOwnerGbn() { return ownerGbn; }
+    public void setOwnerGbn(String ownerGbn) { this.ownerGbn = ownerGbn; }
+
+    public String getActionLvl() { return actionLvl; }
+    public void setActionLvl(String actionLvl) { this.actionLvl = actionLvl; }
+
+    public int getSortLvl() { return sortLvl; }
+    public void setSortLvl(int sortLvl) { this.sortLvl = sortLvl; }
+}
