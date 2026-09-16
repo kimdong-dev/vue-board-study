@@ -1,310 +1,280 @@
-package com.secl.pms.batch.vo;
+package com.secl.pms.batch.legacy.template;
 
-import java.util.Comparator;
 import java.util.Map;
 
 /**
- * EEP 설계진도 Risk Warning 알림 대상 항목 VO
- * Processor 조회 결과 1행 + OWNER_GBN(KEYTASK/ITEM) 조합으로 생성
+ * EEP 설계진도 Risk Warning 알림 메일 템플릿 - 공통 유틸 / 스타일 / 제목
+ * 메일 클라이언트가 외부 CSS를 무시하므로 모든 스타일은 인라인으로 하드코딩한다.
  */
-public class EepAlertItemVo {
+public class EepMailTemplate {
 
-    /* ===== 구분값 상수 ===== */
-    public static final String GBN_KEYTASK = "KEYTASK";
-    public static final String GBN_ITEM    = "ITEM";
-
-    public static final String LVL_IMMD = "IMMD"; // 즉시조치 (D-1, D-2)
-    public static final String LVL_RCVY = "RCVY"; // 만회조치 (D-4, D-3)
-    public static final String LVL_ERLY = "ERLY"; // 조기점검 (D-6, D-5)
-
-    /* ===== Processor 조회 결과 ===== */
-    private String pjtNo;
-    private String vOrder;
-    private String priSeq;
-    private String priDtlSeq;
-    private String mngItemNo;           // 관리항목번호 (MST)
-    private String priMngItemNm;        // Key Task명
-    private String priMngItemSubNm;     // 관리항목명
-    private String planDt;
-    private String mstDisplnCd;
-    private String mstDisplnNm;
-    private String majDisplnCd;
-    private String displnNm;
-    private String mstDsnComp;
-    private String dsnComp;
-    private int    weeksBefore;
-    private int    compLimit;
-    private String ver;                 // V1 / V2 / -
-    private String mstUnderYn;
-    private String dtlUnderYn;
-
-    /* ===== Writer 파생 ===== */
-    private String ownerGbn;            // KEYTASK / ITEM
-    private String actionLvl;           // IMMD / RCVY / ERLY
-    private int    sortLvl;             // 1=D-1V1, 2=D-1V2, 3=D-2, 4=D-4/3, 5=D-6/5
-
-    /* ===== 팩토리 ===== */
-    public static EepAlertItemVo create(Map<String, Object> row, String ownerGbn) {
-        EepAlertItemVo vo = new EepAlertItemVo();
-
-        vo.pjtNo            = str(row.get("pjtNo"));
-        vo.vOrder           = str(row.get("vOrder"));
-        vo.priSeq           = str(row.get("priSeq"));
-        vo.priDtlSeq        = str(row.get("priDtlSeq"));
-        vo.mngItemNo        = str(row.get("mngItemNo"));
-        vo.priMngItemNm     = str(row.get("priMngItemNm"));
-        vo.priMngItemSubNm  = str(row.get("priMngItemSubNm"));
-        vo.planDt           = str(row.get("planDt"));
-        vo.mstDisplnCd      = str(row.get("mstDisplnCd"));
-        vo.mstDisplnNm      = str(row.get("mstDisplnNm"));
-        vo.majDisplnCd      = str(row.get("majDisplnCd"));
-        vo.displnNm         = str(row.get("displnNm"));
-        vo.mstDsnComp       = str(row.get("mstDsnComp"));
-        vo.dsnComp          = str(row.get("dsnComp"));
-        vo.weeksBefore      = num(row.get("weeksBefore"));
-        vo.compLimit        = num(row.get("compLimit"));
-        vo.ver              = str(row.get("ver"));
-        vo.mstUnderYn       = str(row.get("mstUnderYn"));
-        vo.dtlUnderYn       = str(row.get("dtlUnderYn"));
-
-        vo.ownerGbn = ownerGbn;
-        vo.applyDerived();
-        return vo;
+    private EepMailTemplate() {
     }
 
-    private void applyDerived() {
-        if (weeksBefore <= 2) {
-            actionLvl = LVL_IMMD;
-        } else if (weeksBefore <= 4) {
-            actionLvl = LVL_RCVY;
-        } else {
-            actionLvl = LVL_ERLY;
-        }
+    /* ============================================================
+     *  색상 상수 (무채색. 추후 현업 요청 시 여기만 변경)
+     * ============================================================ */
+    public static final String C_TEXT     = "#222222";
+    public static final String C_SUB      = "#767676";
+    public static final String C_LINE     = "#D8D8D8";
+    public static final String C_BANNER   = "#3A3A3A";  // 상단 배너 배경
+    public static final String C_HEAD_BG  = "#4A4A4A";  // 표 헤더 배경
+    public static final String C_BOX_BG   = "#F6F6F6";  // 정보/요약 박스 배경
+    public static final String C_SEC_BG   = "#ECECEC";  // 프로젝트 섹션 배경
 
-        if (weeksBefore == 1) {
-            sortLvl = "V2".equals(ver) ? 2 : 1;
-        } else if (weeksBefore == 2) {
-            sortLvl = 3;
-        } else if (weeksBefore == 3 || weeksBefore == 4) {
-            sortLvl = 4;
-        } else {
-            sortLvl = 5;
-        }
+    /* ============================================================
+     *  공통 스타일 (인라인 style 값)
+     * ============================================================ */
+    public static final String S_WRAP =
+        "margin:0;padding:24px 12px;background-color:#F0F0F0;"
+        + "font-family:'Malgun Gothic','맑은 고딕',Dotum,Arial,sans-serif;";
+
+    public static final String S_CARD =
+        "max-width:760px;margin:0 auto;background-color:#FFFFFF;"
+        + "border:1px solid " + C_LINE + ";";
+
+    public static final String S_BODY_PAD = "padding:28px 32px 32px 32px;";
+
+    public static final String S_P =
+        "margin:0 0 16px 0;font-size:14px;line-height:1.75;color:" + C_TEXT + ";";
+
+    public static final String S_FOOT =
+        "margin:24px 0 0 0;padding-top:16px;border-top:1px solid " + C_LINE + ";"
+        + "font-size:12px;line-height:1.6;color:" + C_SUB + ";";
+
+    public static final String S_INFOBOX =
+        "margin:0 0 20px 0;padding:14px 18px;background-color:" + C_BOX_BG + ";"
+        + "border-left:3px solid " + C_HEAD_BG + ";";
+
+    public static final String S_INFO_ROW =
+        "margin:0 0 6px 0;font-size:13px;line-height:1.6;color:" + C_TEXT + ";";
+
+    public static final String S_INFO_ROW_LAST =
+        "margin:0;font-size:13px;line-height:1.6;color:" + C_TEXT + ";";
+
+    public static final String S_INFO_LABEL =
+        "display:inline-block;min-width:120px;color:" + C_SUB + ";";
+
+    public static final String S_EM = "font-weight:bold;";
+
+    /* 표 */
+    public static final String S_TABLE =
+        "width:100%;border-collapse:collapse;margin:4px 0 20px 0;"
+        + "font-size:12px;color:" + C_TEXT + ";";
+
+    public static final String S_TH =
+        "padding:10px 8px;background-color:" + C_HEAD_BG + ";color:#FFFFFF;"
+        + "font-weight:normal;text-align:left;border:1px solid " + C_HEAD_BG + ";"
+        + "white-space:nowrap;";
+
+    public static final String S_TD =
+        "padding:9px 8px;border:1px solid " + C_LINE + ";vertical-align:top;line-height:1.5;";
+
+    public static final String S_TD_C =
+        "padding:9px 8px;border:1px solid " + C_LINE + ";vertical-align:top;"
+        + "line-height:1.5;text-align:center;white-space:nowrap;";
+
+    /* 프로젝트 섹션 헤더 (MultiProject) */
+    public static final String S_SECTION =
+        "margin:22px 0 8px 0;padding:8px 12px;background-color:" + C_SEC_BG + ";"
+        + "border-left:4px solid " + C_HEAD_BG + ";font-size:13px;font-weight:bold;"
+        + "color:" + C_TEXT + ";";
+
+    /* 요약 카운트 박스 */
+    public static final String S_SUMMARY =
+        "margin:0 0 20px 0;padding:16px 18px;background-color:" + C_BOX_BG + ";"
+        + "border:1px solid " + C_LINE + ";";
+
+    public static final String S_SUM_MAIN =
+        "margin:0 0 10px 0;font-size:14px;line-height:1.6;color:" + C_TEXT + ";";
+
+    public static final String S_SUM_SUB =
+        "margin:0;font-size:13px;line-height:1.6;color:" + C_SUB + ";";
+
+    /* ============================================================
+     *  헤더 배너 / 고정 문구
+     * ============================================================ */
+    public static final String HEAD_RISK   = "[자동 리스크 알람]";
+    public static final String HEAD_NOTICE = "[자동 안내 알람]";
+    public static final String HEAD_DIGEST = "[자동 리스크 다이제스트]";
+
+    public static final String LEAD_TEXT =
+        "본 메일은 설계 진도 관리 시스템에 의해 자동 발송되었습니다.";
+
+    public static final String FOOT_TEXT =
+        "본 메시지는 사전 설정된 관리 기준에 따라 시스템에서 자동 생성되었습니다.";
+
+    /** 상단 배너 HTML */
+    public static String banner(String headText) {
+        return "<div style=\"padding:16px 32px;background-color:" + C_BANNER + ";\">"
+             + "<span style=\"font-size:15px;font-weight:bold;color:#FFFFFF;"
+             + "letter-spacing:0.5px;\">" + headText + "</span>"
+             + "</div>";
     }
 
-    /* ===== 구분별 표시값 ===== */
-    public boolean isKeyTask() {
-        return GBN_KEYTASK.equals(ownerGbn);
-    }
-
-    /** 표 '구분' 컬럼 */
-    public String getTypeNm() {
-        return isKeyTask() ? "Key Task" : "관리항목";
-    }
-
-    /** 표 '명칭' 컬럼 */
-    public String getViewName() {
-        return isKeyTask() ? priMngItemNm : priMngItemSubNm;
-    }
-
-    /** 표 '관련 Key Task' 컬럼 (Key Task 건이면 '-') */
-    public String getViewKeyTask() {
-        return isKeyTask() ? "-" : priMngItemNm;
-    }
-
-    /** 해당 건의 완성도 */
-    public String getViewComp() {
-        return isKeyTask() ? mstDsnComp : dsnComp;
-    }
-
-    /** 해당 건의 공종코드 */
-    public String getViewDisplnCd() {
-        return isKeyTask() ? mstDisplnCd : majDisplnCd;
-    }
-
-    /** 해당 건의 공종명 */
-    public String getViewDisplnNm() {
-        return isKeyTask() ? mstDisplnNm : displnNm;
-    }
-
-    /** 미달여부 */
-    public boolean isUnder() {
-        return isKeyTask() ? "Y".equals(mstUnderYn) : "Y".equals(dtlUnderYn);
-    }
-
-    /* ===== 표기용 문구 ===== */
-
-    /** 단계: "D-1주 (V1)" / "D-2주" */
-    public String getStageNm() {
-        if (weeksBefore == 1) {
-            return "D-1주 (" + ("V2".equals(ver) ? "V2" : "V1") + ")";
-        }
-        return "D-" + weeksBefore + "주";
-    }
-
-    /** 상태 */
-    public String getStatusNm() {
-        if (isKeyTask()) {
-            if (weeksBefore <= 2) {
-                return "즉시 조치 필요";
-            } else if (weeksBefore <= 4) {
-                return "만회 조치 필요";
-            }
-            return "조기 점검 필요";
-        }
-
-        if (weeksBefore == 1) {
-            return "V2".equals(ver) ? "진행율 저조 - 완료 전 최종 점검" : "진행율 저조 - 품질·일정 리스크";
-        } else if (weeksBefore == 2) {
-            return "진행율 저조 - 즉시 조치 필요";
-        } else if (weeksBefore <= 4) {
-            return "진행율 저조 지속 - 만회 조치 필요";
-        }
-        return "진행율 저조 - 조기 점검 필요";
-    }
-
-    /** 필요 조치 */
-    public String getActionNm() {
-        if (isKeyTask()) {
-            if (weeksBefore <= 2) {
-                return "즉시 검토 및 조치, 관련 담당자 협의 필수";
-            } else if (weeksBefore <= 4) {
-                return "지체 없이 완료 조치, LE와 협의";
-            }
-            return "하위 관리항목 조기 점검";
-        }
-
-        if (weeksBefore <= 2) {
-            return "즉시 완료 조치, 프로젝트 LE 협의 필수";
-        } else if (weeksBefore <= 4) {
-            return "지체 없이 완료 조치, LE와 협의";
-        }
-        return "조기 점검 및 완료 조치";
-    }
-
-    /* ===== 그룹핑/중복제거 키 ===== */
-    /**
-     * Key Task 건은 상세 단위가 아니므로 priDtlSeq를 제외한다.
-     * (제외하지 않으면 하위 상세 개수만큼 같은 Key Task가 중복됨)
-     */
-    public String getItemKey() {
-        StringBuilder sb = new StringBuilder();
-        sb.append(pjtNo).append("|").append(priSeq).append("|");
-        if (isKeyTask()) {
-            sb.append("MST");
-        } else {
-            sb.append(priDtlSeq);
-        }
-        sb.append("|").append(ownerGbn);
-        sb.append("|").append(weeksBefore);
-        sb.append("|").append(ver);
+    /** 카드 래핑: 배너 + 리드문구 + 본문 + 푸터 */
+    public static String wrap(String headText, String innerHtml) {
+        StringBuilder sb = new StringBuilder(4096);
+        sb.append("<div style=\"").append(S_WRAP).append("\">");
+        sb.append("<div style=\"").append(S_CARD).append("\">");
+        sb.append(banner(headText));
+        sb.append("<div style=\"").append(S_BODY_PAD).append("\">");
+        sb.append("<p style=\"").append(S_P).append("\">").append(LEAD_TEXT).append("</p>");
+        sb.append(innerHtml);
+        sb.append("<p style=\"").append(S_FOOT).append("\">").append(FOOT_TEXT).append("</p>");
+        sb.append("</div></div></div>");
         return sb.toString();
     }
 
-    /* ===== 정렬: 단계 우선, 동일단계면 Key Task 우선 ===== */
-    public static final Comparator<EepAlertItemVo> SORT = new Comparator<EepAlertItemVo>() {
-        public int compare(EepAlertItemVo a, EepAlertItemVo b) {
-            if (a.sortLvl != b.sortLvl) {
-                return a.sortLvl - b.sortLvl;
-            }
-            int ga = a.isKeyTask() ? 0 : 1;
-            int gb = b.isKeyTask() ? 0 : 1;
-            if (ga != gb) {
-                return ga - gb;
-            }
-            return nvl(a.getViewName()).compareTo(nvl(b.getViewName()));
-        }
-    };
+    /* ============================================================
+     *  치환 유틸
+     * ============================================================ */
 
-    /* ===== util ===== */
-    private static String str(Object o) {
-        return o == null ? "" : String.valueOf(o);
+    /** {{KEY}} 형태를 param 값으로 치환 */
+    public static String render(String tmpl, Map<String, String> param) {
+        if (tmpl == null) {
+            return "";
+        }
+        String result = tmpl;
+        for (Map.Entry<String, String> e : param.entrySet()) {
+            result = replaceAll(result, "{{" + e.getKey() + "}}", nvl(e.getValue()));
+        }
+        return result;
     }
 
-    private static int num(Object o) {
-        if (o == null) {
-            return 0;
+    /** 정규식 미사용 전체 치환 */
+    public static String replaceAll(String src, String from, String to) {
+        if (src == null || from == null || from.length() == 0) {
+            return src;
         }
-        try {
-            String s = String.valueOf(o).trim();
-            int dot = s.indexOf('.');
-            if (dot > -1) {
-                s = s.substring(0, dot);
+        StringBuilder sb = new StringBuilder(src.length());
+        int pos = 0;
+        while (true) {
+            int idx = src.indexOf(from, pos);
+            if (idx < 0) {
+                sb.append(src.substring(pos));
+                break;
             }
-            return Integer.parseInt(s);
-        } catch (Exception e) {
-            return 0;
+            sb.append(src, pos, idx).append(to);
+            pos = idx + from.length();
         }
+        return sb.toString();
     }
 
-    private static String nvl(String s) {
+    /** HTML 이스케이프 */
+    public static String esc(String s) {
+        if (s == null || s.length() == 0) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(s.length() + 16);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '&') {
+                sb.append("&amp;");
+            } else if (c == '<') {
+                sb.append("&lt;");
+            } else if (c == '>') {
+                sb.append("&gt;");
+            } else if (c == '"') {
+                sb.append("&quot;");
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    public static String nvl(String s) {
         return s == null ? "" : s;
     }
 
-    /* ===== getter / setter ===== */
-    public String getPjtNo() { return pjtNo; }
-    public void setPjtNo(String pjtNo) { this.pjtNo = pjtNo; }
+    /* ============================================================
+     *  메일 제목 (KR) - Alert_Settings No.1~10 + Digest / MultiProject
+     * ============================================================ */
 
-    public String getVOrder() { return vOrder; }
-    public void setVOrder(String vOrder) { this.vOrder = vOrder; }
+    /* --- 단건: 관리항목 담당자 (Item Owner) --- */
+    public static final String KR_SUBJ_ITEM_D6 =
+        "[Risk Warning] [Project: {{PJT}}] [관리항목: {{ITEM_NM}}] – 진도 관리 필요 – 조기 점검 요청";
+    public static final String KR_SUBJ_ITEM_D4 =
+        "[Risk Warning] [Project: {{PJT}}] [관리항목: {{ITEM_NM}}] – 진도 관리 필요 – 만회 조치 요청";
+    public static final String KR_SUBJ_ITEM_D2 =
+        "[Risk Warning] [Project: {{PJT}}] [관리항목: {{ITEM_NM}}] – 진도 관리 필요 – 즉시 조치 필요";
+    public static final String KR_SUBJ_ITEM_D1V1 =
+        "[Risk Warning] [Project: {{PJT}}] [관리항목: {{ITEM_NM}}] – D-1주 – 품질·일정 리스크";
+    public static final String KR_SUBJ_ITEM_D1V2 =
+        "[Notice] [Project: {{PJT}}] [관리항목: {{ITEM_NM}}] – D-1주 – 최종 점검 필요";
 
-    public String getPriSeq() { return priSeq; }
-    public void setPriSeq(String priSeq) { this.priSeq = priSeq; }
+    /* --- 단건: Key Task 담당 --- */
+    public static final String KR_SUBJ_KT_D6 =
+        "[Risk Warning] [Project: {{PJT}}] [Key Task: {{KEYTASK_NM}}] – 진도 관리 필요 – 조기 점검 요청";
+    public static final String KR_SUBJ_KT_D4 =
+        "[Risk Warning] [Project: {{PJT}}] [Key Task: {{KEYTASK_NM}}] – 진도 관리 필요 – 만회 조치 요청";
+    public static final String KR_SUBJ_KT_D2 =
+        "[Risk Warning] [Project: {{PJT}}] [Key Task: {{KEYTASK_NM}}] – 진도 관리 필요 – 즉시 조치 필요";
+    public static final String KR_SUBJ_KT_D1V1 =
+        "[Risk Warning] [Project: {{PJT}}] [Key Task: {{KEYTASK_NM}}] – D-1주 – 품질·일정 리스크";
+    public static final String KR_SUBJ_KT_D1V2 =
+        "[Notice] [Project: {{PJT}}] [Key Task: {{KEYTASK_NM}}] – D-1주 – 최종 점검 필요";
 
-    public String getPriDtlSeq() { return priDtlSeq; }
-    public void setPriDtlSeq(String priDtlSeq) { this.priDtlSeq = priDtlSeq; }
+    /* --- Digest (단일 프로젝트) --- */
+    public static final String KR_SUBJ_DIGEST_IMMD =
+        "[Risk Warning] [Project: {{PJT}}] 금일 확인 필요 항목 {{N}}건 (즉시조치 포함)";
+    public static final String KR_SUBJ_DIGEST_RCVY =
+        "[Risk Warning] [Project: {{PJT}}] 금일 확인 필요 항목 {{N}}건 (만회조치 필요)";
+    public static final String KR_SUBJ_DIGEST_ERLY =
+        "[Risk Warning] [Project: {{PJT}}] 금일 확인 필요 항목 {{N}}건 (조기점검)";
+    public static final String KR_SUBJ_DIGEST_NEAR =
+        "[Risk Warning] [Project: {{PJT}}] 금일 확인 필요 항목 {{N}}건 – 완료 임박 포함";
 
-    public String getMngItemNo() { return mngItemNo; }
-    public void setMngItemNo(String mngItemNo) { this.mngItemNo = mngItemNo; }
+    /* --- MultiProject Digest --- */
+    public static final String KR_SUBJ_MULTI_IMMD =
+        "[Risk Warning] [담당 프로젝트 {{M}}건] 금일 확인 필요 항목 {{N}}건 (즉시조치 포함)";
+    public static final String KR_SUBJ_MULTI_RCVY =
+        "[Risk Warning] [담당 프로젝트 {{M}}건] 금일 확인 필요 항목 {{N}}건 (만회조치 필요)";
+    public static final String KR_SUBJ_MULTI_ERLY =
+        "[Risk Warning] [담당 프로젝트 {{M}}건] 금일 확인 필요 항목 {{N}}건 (조기점검)";
+    public static final String KR_SUBJ_MULTI_NEAR =
+        "[Risk Warning] [담당 프로젝트 {{M}}건] 금일 확인 필요 항목 {{N}}건 – 완료 임박 포함";
 
-    public String getPriMngItemNm() { return priMngItemNm; }
-    public void setPriMngItemNm(String priMngItemNm) { this.priMngItemNm = priMngItemNm; }
+    /* ============================================================
+     *  제목 선택
+     * ============================================================ */
 
-    public String getPriMngItemSubNm() { return priMngItemSubNm; }
-    public void setPriMngItemSubNm(String priMngItemSubNm) { this.priMngItemSubNm = priMngItemSubNm; }
+    /** 단건 제목 선택 */
+    public static String pickSingleSubject(boolean isKeyTask, int weeksBefore, String ver) {
+        if (isKeyTask) {
+            if (weeksBefore == 1) {
+                return "V2".equals(ver) ? KR_SUBJ_KT_D1V2 : KR_SUBJ_KT_D1V1;
+            } else if (weeksBefore == 2) {
+                return KR_SUBJ_KT_D2;
+            } else if (weeksBefore == 3 || weeksBefore == 4) {
+                return KR_SUBJ_KT_D4;
+            }
+            return KR_SUBJ_KT_D6;
+        }
 
-    public String getPlanDt() { return planDt; }
-    public void setPlanDt(String planDt) { this.planDt = planDt; }
+        if (weeksBefore == 1) {
+            return "V2".equals(ver) ? KR_SUBJ_ITEM_D1V2 : KR_SUBJ_ITEM_D1V1;
+        } else if (weeksBefore == 2) {
+            return KR_SUBJ_ITEM_D2;
+        } else if (weeksBefore == 3 || weeksBefore == 4) {
+            return KR_SUBJ_ITEM_D4;
+        }
+        return KR_SUBJ_ITEM_D6;
+    }
 
-    public String getMstDisplnCd() { return mstDisplnCd; }
-    public void setMstDisplnCd(String mstDisplnCd) { this.mstDisplnCd = mstDisplnCd; }
-
-    public String getMstDisplnNm() { return mstDisplnNm; }
-    public void setMstDisplnNm(String mstDisplnNm) { this.mstDisplnNm = mstDisplnNm; }
-
-    public String getMajDisplnCd() { return majDisplnCd; }
-    public void setMajDisplnCd(String majDisplnCd) { this.majDisplnCd = majDisplnCd; }
-
-    public String getDisplnNm() { return displnNm; }
-    public void setDisplnNm(String displnNm) { this.displnNm = displnNm; }
-
-    public String getMstDsnComp() { return mstDsnComp; }
-    public void setMstDsnComp(String mstDsnComp) { this.mstDsnComp = mstDsnComp; }
-
-    public String getDsnComp() { return dsnComp; }
-    public void setDsnComp(String dsnComp) { this.dsnComp = dsnComp; }
-
-    public int getWeeksBefore() { return weeksBefore; }
-    public void setWeeksBefore(int weeksBefore) { this.weeksBefore = weeksBefore; }
-
-    public int getCompLimit() { return compLimit; }
-    public void setCompLimit(int compLimit) { this.compLimit = compLimit; }
-
-    public String getVer() { return ver; }
-    public void setVer(String ver) { this.ver = ver; }
-
-    public String getMstUnderYn() { return mstUnderYn; }
-    public void setMstUnderYn(String mstUnderYn) { this.mstUnderYn = mstUnderYn; }
-
-    public String getDtlUnderYn() { return dtlUnderYn; }
-    public void setDtlUnderYn(String dtlUnderYn) { this.dtlUnderYn = dtlUnderYn; }
-
-    public String getOwnerGbn() { return ownerGbn; }
-    public void setOwnerGbn(String ownerGbn) { this.ownerGbn = ownerGbn; }
-
-    public String getActionLvl() { return actionLvl; }
-    public void setActionLvl(String actionLvl) { this.actionLvl = actionLvl; }
-
-    public int getSortLvl() { return sortLvl; }
-    public void setSortLvl(int sortLvl) { this.sortLvl = sortLvl; }
+    /**
+     * Digest / MultiProject 제목 선택 (계단식)
+     * D-1주 있으면 완료임박 > D-2 즉시조치 > D-4/3 만회조치 > D-6/5 조기점검
+     */
+    public static String pickDigestSubject(boolean hasD1, boolean hasD2, boolean hasD4, boolean isMulti) {
+        if (hasD1) {
+            return isMulti ? KR_SUBJ_MULTI_NEAR : KR_SUBJ_DIGEST_NEAR;
+        } else if (hasD2) {
+            return isMulti ? KR_SUBJ_MULTI_IMMD : KR_SUBJ_DIGEST_IMMD;
+        } else if (hasD4) {
+            return isMulti ? KR_SUBJ_MULTI_RCVY : KR_SUBJ_DIGEST_RCVY;
+        }
+        return isMulti ? KR_SUBJ_MULTI_ERLY : KR_SUBJ_DIGEST_ERLY;
+    }
 }
