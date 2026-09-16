@@ -1,281 +1,570 @@
-package com.secl.pms.batch.legacy.template;
+package com.secl.pms.batch.legacy.writer;
 
+import java.io.UnsupportedEncodingException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+
+import org.springframework.batch.item.ItemWriter;
+
+import com.secl.common.batch.service.BatchMaillingService;
+import com.secl.pms.batch.support.PmsAbstractStep;
+import com.secl.pms.batch.template.eep.EepMailBody;
+import com.secl.pms.batch.template.eep.EepMailTable;
+import com.secl.pms.batch.template.eep.EepMailTemplate;
+import com.secl.pms.batch.vo.ProcessorResultVo;
+import com.secl.pms.batch.vo.TransactionVo;
+import com.secl.pms.batch.vo.eep.EepAlertItemVo;
 
 /**
- * EEP 설계진도 Risk Warning 알림 메일 템플릿 - 공통 유틸 / 스타일 / 제목
- * 메일 클라이언트가 외부 CSS를 무시하므로 모든 스타일은 인라인으로 하드코딩한다.
+ * EEP 설계진도 Risk Warning 알림 메일 Writer
+ *
+ * 처리 순서
+ *   1. Processor 결과를 항목 VO 목록으로 변환 (마스터 미달 / 상세 미달 각각 1건씩)
+ *   2. 수신자 조회용 파라미터(listParamMap) 구성
+ *   3. 공종별 수신자(LE/그룹장/팀장) 조회
+ *   4. 수신자 × 항목 매칭 → 수신자(사번) 단위로 묶음
+ *   5. 수신자별로 메일 유형 판정 → 제목/본문 생성 → 로그 테이블 기록
+ *
+ * ※ 검증 단계이므로 실제 메일 발송(registerMail)은 주석 처리 상태.
  */
-public class EepMailTemplate {
+@SuppressWarnings({ "rawtypes", "unchecked" })
+public class EepMailingWriter extends PmsAbstractStep implements ItemWriter<ProcessorResultVo> {
 
-    private EepMailTemplate() {
+    private final static String SQL = "EEP_MAILING.";
+
+    /** '설계본부'의 EPID (SELECT EPIP FROM SINGLE_USERINFO WHERE CN = '설계본부') */
+    private final static String SENDER_EP_ID = "M200309045649D801776";
+
+    /** 메일 제목/본문 컬럼 최대 바이트 */
+    private final static int TITLE_MAX_BYTES = 2000;
+    private final static int BODY_MAX_BYTES  = 4000;
+
+    protected BatchMaillingService batchMaillingService;
+
+    public void setBatchMaillingService(BatchMaillingService batchMaillingService) {
+        this.batchMaillingService = batchMaillingService;
     }
 
-    /* ============================================================
-     *  색상 상수 (무채색. 추후 현업 요청 시 여기만 변경)
-     * ============================================================ */
-    public static final String C_TEXT     = "#222222";
-    public static final String C_SUB      = "#767676";
-    public static final String C_LINE     = "#D8D8D8";
-    public static final String C_BANNER   = "#3A3A3A";  // 상단 배너 배경
-    public static final String C_HEAD_BG  = "#4A4A4A";  // 표 헤더 배경
-    public static final String C_BOX_BG   = "#F6F6F6";  // 정보/요약 박스 배경
-    public static final String C_SEC_BG   = "#ECECEC";  // 프로젝트 섹션 배경
+    @Override
+    public void write(List<? extends ProcessorResultVo> items) throws Exception {
 
-    /* ============================================================
-     *  공통 스타일 (인라인 style 값)
-     * ============================================================ */
-    public static final String S_WRAP =
-        "margin:0;padding:24px 12px;background-color:#F0F0F0;"
-        + "font-family:'Malgun Gothic','맑은 고딕',Dotum,Arial,sans-serif;";
+        TransactionVo insertVo = new TransactionVo(this);
+        String batchDt = new SimpleDateFormat("yyyyMMdd").format(new Date());
 
-    public static final String S_CARD =
-        "max-width:760px;margin:0 auto;background-color:#FFFFFF;"
-        + "border:1px solid " + C_LINE + ";";
+        for (ProcessorResultVo item : items) {
+            int ifCnt = 0;  // 알림 대상 항목 수
+            int prCnt = 0;  // 생성된 메일 수
 
-    public static final String S_BODY_PAD = "padding:28px 32px 32px 32px;";
+            insertVo.setPjtNo(item.getPjtNo());
+            insertVo.setVersion(item.getVersion());
 
-    public static final String S_P =
-        "margin:0 0 16px 0;font-size:14px;line-height:1.75;color:" + C_TEXT + ";";
+            List targetList = item.getResultSet("eepPriDtlNotiTargetList");
+            if (targetList == null || targetList.isEmpty()) {
+                this.loggingPjtEnd(item.getPjtNo(), item.getVersion(), insertVo, ifCnt, prCnt);
+                continue;
+            }
 
-    public static final String S_FOOT =
-        "margin:24px 0 0 0;padding-top:16px;border-top:1px solid " + C_LINE + ";"
-        + "font-size:12px;line-height:1.6;color:" + C_SUB + ";";
+            /* ---------- 1. 항목 VO 목록 생성 ---------- */
+            List<EepAlertItemVo> alertList = createAlertList(targetList);
+            ifCnt = alertList.size();
 
-    public static final String S_INFOBOX =
-        "margin:0 0 20px 0;padding:14px 18px;background-color:" + C_BOX_BG + ";"
-        + "border-left:3px solid " + C_HEAD_BG + ";";
+            /* ---------- 2. 수신자 조회 파라미터 구성 ---------- */
+            insertVo.setListParamMap(createListParamMap(targetList));
 
-    public static final String S_INFO_ROW =
-        "margin:0 0 6px 0;font-size:13px;line-height:1.6;color:" + C_TEXT + ";";
+            /* ---------- 3. 수신자 조회 ---------- */
+            List rcvrList = sqlTemplate.selectList(SQL + "selectEepPriDtlNotiRcvrList", insertVo);
+            if (rcvrList == null || rcvrList.isEmpty()) {
+                this.loggingPjtEnd(item.getPjtNo(), item.getVersion(), insertVo, ifCnt, prCnt);
+                continue;
+            }
 
-    public static final String S_INFO_ROW_LAST =
-        "margin:0;font-size:13px;line-height:1.6;color:" + C_TEXT + ";";
+            /* ---------- 4. 수신자 × 항목 매칭 ---------- */
+            Map<String, Map<String, Object>>         rcvrInfoMap = new LinkedHashMap<String, Map<String, Object>>();
+            Map<String, Map<String, EepAlertItemVo>> rcvrItemMap = new LinkedHashMap<String, Map<String, EepAlertItemVo>>();
 
-    public static final String S_INFO_LABEL =
-        "display:inline-block;min-width:120px;color:" + C_SUB + ";";
+            matchRcvrAndItem(rcvrList, alertList, rcvrInfoMap, rcvrItemMap);
 
-    public static final String S_EM = "font-weight:bold;";
+            /* ---------- 5. 수신자별 메일 생성 / 로그 기록 ---------- */
+            for (Map.Entry<String, Map<String, EepAlertItemVo>> entry : rcvrItemMap.entrySet()) {
+                String empno = entry.getKey();
 
-    /* 표 */
-    public static final String S_TABLE =
-        "width:100%;border-collapse:collapse;margin:4px 0 20px 0;"
-        + "font-size:12px;color:" + C_TEXT + ";";
+                List<EepAlertItemVo> myList = new ArrayList<EepAlertItemVo>(entry.getValue().values());
+                if (myList.isEmpty()) {
+                    continue;
+                }
+                Collections.sort(myList, EepAlertItemVo.SORT);
 
-    public static final String S_TH =
-        "padding:10px 8px;background-color:" + C_HEAD_BG + ";color:#FFFFFF;"
-        + "font-weight:normal;text-align:left;border:1px solid " + C_HEAD_BG + ";"
-        + "white-space:nowrap;";
+                makeAndLogMail(batchDt, empno, rcvrInfoMap.get(empno), myList);
+                prCnt++;
+            }
 
-    public static final String S_TD =
-        "padding:9px 8px;border:1px solid " + C_LINE + ";vertical-align:top;line-height:1.5;";
-
-    public static final String S_TD_C =
-        "padding:9px 8px;border:1px solid " + C_LINE + ";vertical-align:top;"
-        + "line-height:1.5;text-align:center;white-space:nowrap;";
-
-    /* 프로젝트 섹션 헤더 (MultiProject) */
-    public static final String S_SECTION =
-        "margin:22px 0 8px 0;padding:8px 12px;background-color:" + C_SEC_BG + ";"
-        + "border-left:4px solid " + C_HEAD_BG + ";font-size:13px;font-weight:bold;"
-        + "color:" + C_TEXT + ";";
-
-    /* 요약 카운트 박스 */
-    public static final String S_SUMMARY =
-        "margin:0 0 20px 0;padding:16px 18px;background-color:" + C_BOX_BG + ";"
-        + "border:1px solid " + C_LINE + ";";
-
-    public static final String S_SUM_MAIN =
-        "margin:0 0 10px 0;font-size:14px;line-height:1.6;color:" + C_TEXT + ";";
-
-    public static final String S_SUM_SUB =
-        "margin:0;font-size:13px;line-height:1.6;color:" + C_SUB + ";";
-
-    /* ============================================================
-     *  헤더 배너 / 고정 문구
-     * ============================================================ */
-    public static final String HEAD_RISK   = "[자동 리스크 알람]";
-    public static final String HEAD_NOTICE = "[자동 안내 알람]";
-    public static final String HEAD_DIGEST = "[자동 리스크 다이제스트]";
-
-    public static final String LEAD_TEXT =
-        "본 메일은 설계 진도 관리 시스템에 의해 자동 발송되었습니다.";
-
-    public static final String FOOT_TEXT =
-        "본 메시지는 사전 설정된 관리 기준에 따라 시스템에서 자동 생성되었습니다.";
-
-    /** 상단 배너 HTML */
-    public static String banner(String headText) {
-        return "<div style=\"padding:16px 32px;background-color:" + C_BANNER + ";\">"
-             + "<span style=\"font-size:15px;font-weight:bold;color:#FFFFFF;"
-             + "letter-spacing:0.5px;\">" + headText + "</span>"
-             + "</div>";
-    }
-
-    /** 카드 래핑: 배너 + 리드문구 + 본문 + 푸터 */
-    public static String wrap(String headText, String innerHtml) {
-        StringBuilder sb = new StringBuilder(4096);
-        sb.append("<div style=\"").append(S_WRAP).append("\">");
-        sb.append("<div style=\"").append(S_CARD).append("\">");
-        sb.append(banner(headText));
-        sb.append("<div style=\"").append(S_BODY_PAD).append("\">");
-        sb.append("<p style=\"").append(S_P).append("\">").append(LEAD_TEXT).append("</p>");
-        sb.append(innerHtml);
-        sb.append("<p style=\"").append(S_FOOT).append("\">").append(FOOT_TEXT).append("</p>");
-        sb.append("</div></div></div>");
-        return sb.toString();
-    }
-
-    /* ============================================================
-     *  치환 유틸
-     * ============================================================ */
-
-    /** {{KEY}} 형태를 param 값으로 치환 */
-    public static String render(String tmpl, Map<String, String> param) {
-        if (tmpl == null) {
-            return "";
+            /* 작업 결과 기록 */
+            this.loggingPjtEnd(item.getPjtNo(), item.getVersion(), insertVo, ifCnt, prCnt);
         }
-        String result = tmpl;
-        for (Map.Entry<String, String> e : param.entrySet()) {
-            result = replaceAll(result, "{{" + e.getKey() + "}}", nvl(e.getValue()));
+    }
+
+    /* ============================================================
+     *  1. 항목 VO 목록 생성
+     *     한 행에서 마스터 미달 / 상세 미달이 동시에 발생할 수 있으므로
+     *     각각 별도의 VO로 생성한다.
+     * ============================================================ */
+    private List<EepAlertItemVo> createAlertList(List targetList) {
+        List<EepAlertItemVo> result = new ArrayList<EepAlertItemVo>();
+        Set<String> dupCheck = new LinkedHashSet<String>();
+
+        for (Object obj : targetList) {
+            Map<String, Object> row = (Map<String, Object>) obj;
+
+            // Key Task(마스터) 미달 건
+            if ("Y".equals(str(row.get("mstUnderYn")))) {
+                EepAlertItemVo vo = EepAlertItemVo.create(row, EepAlertItemVo.GBN_KEYTASK);
+                if (dupCheck.add(vo.getItemKey())) {
+                    result.add(vo);
+                }
+            }
+
+            // 상세관리항목 미달 건
+            if ("Y".equals(str(row.get("dtlUnderYn")))) {
+                EepAlertItemVo vo = EepAlertItemVo.create(row, EepAlertItemVo.GBN_ITEM);
+                if (dupCheck.add(vo.getItemKey())) {
+                    result.add(vo);
+                }
+            }
         }
         return result;
     }
 
-    /** 정규식 미사용 전체 치환 */
-    public static String replaceAll(String src, String from, String to) {
-        if (src == null || from == null || from.length() == 0) {
+    /* ============================================================
+     *  2. 수신자 조회 파라미터 (PJT_NO + PRI_SEQ + PRI_DTL_SEQ)
+     *     전 프로젝트 대상이므로 PJT_NO 필수
+     * ============================================================ */
+    private List<Map<String, Object>> createListParamMap(List targetList) {
+        List<Map<String, Object>> result = new ArrayList<Map<String, Object>>();
+        Set<String> dupCheck = new LinkedHashSet<String>();
+
+        for (Object obj : targetList) {
+            Map<String, Object> row = (Map<String, Object>) obj;
+
+            String pjtNo     = str(row.get("pjtNo"));
+            String priSeq     = str(row.get("priSeq"));
+            String priDtlSeq = str(row.get("priDtlSeq"));
+
+            String key = pjtNo + "_" + priSeq + "_" + priDtlSeq;
+            if (dupCheck.add(key)) {
+                Map<String, Object> param = new HashMap<String, Object>();
+                param.put("pjtNo", pjtNo);
+                param.put("priSeq", priSeq);
+                param.put("priDtlSeq", priDtlSeq);
+                result.add(param);
+            }
+        }
+        return result;
+    }
+
+    /* ============================================================
+     *  4. 수신자 × 항목 매칭
+     *     - 수신자 1행 = (프로젝트, 관리항목, 구분(KEYTASK/ITEM), 공종) 단위
+     *     - 해당 구분이 미달이고 공종이 일치하는 항목만 담는다
+     *     - 팀장은 D-1주 / D-2주만 수신 (기획서 r2)
+     * ============================================================ */
+    private void matchRcvrAndItem(List rcvrList,
+                                  List<EepAlertItemVo> alertList,
+                                  Map<String, Map<String, Object>> rcvrInfoMap,
+                                  Map<String, Map<String, EepAlertItemVo>> rcvrItemMap) {
+
+        /* 항목을 (프로젝트|마스터순번|상세순번|구분) 키로 색인 */
+        Map<String, List<EepAlertItemVo>> itemIndex = new HashMap<String, List<EepAlertItemVo>>();
+        for (EepAlertItemVo vo : alertList) {
+            String key = matchKey(vo.getPjtNo(), vo.getPriSeq(), vo.getPriDtlSeq(), vo.getOwnerGbn());
+            List<EepAlertItemVo> bucket = itemIndex.get(key);
+            if (bucket == null) {
+                bucket = new ArrayList<EepAlertItemVo>();
+                itemIndex.put(key, bucket);
+            }
+            bucket.add(vo);
+        }
+
+        for (Object obj : rcvrList) {
+            Map<String, Object> rcvr = (Map<String, Object>) obj;
+
+            String empno    = str(rcvr.get("empno"));
+            String recvGbn  = str(rcvr.get("recvGbn"));   // LE / GROUP_MANAGER / TEAM_MANAGER
+            String ownerGbn = str(rcvr.get("ownerGbn"));  // KEYTASK / ITEM
+            String discCd   = str(rcvr.get("discCd"));    // 수신자 공종코드
+
+            if (empno.length() == 0) {
+                continue;
+            }
+
+            String key = matchKey(str(rcvr.get("pjtNo")), str(rcvr.get("priSeq")),
+                                  str(rcvr.get("priDtlSeq")), ownerGbn);
+            List<EepAlertItemVo> bucket = itemIndex.get(key);
+            if (bucket == null) {
+                continue;
+            }
+
+            for (EepAlertItemVo vo : bucket) {
+                // 공종 일치 확인
+                if (!discCd.equals(vo.getViewDisplnCd())) {
+                    continue;
+                }
+                // 팀장은 D-1주 / D-2주만 발송
+                if ("TEAM_MANAGER".equals(recvGbn) && vo.getWeeksBefore() > 2) {
+                    continue;
+                }
+
+                // 수신자 기본정보는 첫 매칭 시점에 보관
+                if (!rcvrInfoMap.containsKey(empno)) {
+                    rcvrInfoMap.put(empno, rcvr);
+                    rcvrItemMap.put(empno, new LinkedHashMap<String, EepAlertItemVo>());
+                }
+                // itemKey 기준 중복 제거 (공종 복수 매핑 시 같은 항목이 여러 번 매칭됨)
+                rcvrItemMap.get(empno).put(vo.getItemKey(), vo);
+            }
+        }
+    }
+
+    private String matchKey(String pjtNo, String priSeq, String priDtlSeq, String ownerGbn) {
+        return pjtNo + "|" + priSeq + "|" + priDtlSeq + "|" + ownerGbn;
+    }
+
+    /* ============================================================
+     *  5. 수신자 1명분 메일 생성 + 로그 기록
+     * ============================================================ */
+    private void makeAndLogMail(String batchDt,
+                                String empno,
+                                Map<String, Object> rcvrInfo,
+                                List<EepAlertItemVo> myList) throws Exception {
+
+        /* ---------- 집계 ---------- */
+        int n = myList.size();
+        int immd = 0;   // 즉시조치
+        int rcvy = 0;   // 만회조치
+        int erly = 0;   // 조기점검
+
+        boolean hasD1 = false;
+        boolean hasD2 = false;
+        boolean hasD4 = false;
+
+        Set<String> pjtSet      = new LinkedHashSet<String>();  // 프로젝트 표기명
+        Set<String> displnNmSet = new LinkedHashSet<String>();  // 공종명
+        Set<String> displnCdSet = new LinkedHashSet<String>();  // 공종코드
+
+        for (EepAlertItemVo vo : myList) {
+            if (EepAlertItemVo.LVL_IMMD.equals(vo.getActionLvl())) {
+                immd++;
+            } else if (EepAlertItemVo.LVL_RCVY.equals(vo.getActionLvl())) {
+                rcvy++;
+            } else {
+                erly++;
+            }
+
+            int w = vo.getWeeksBefore();
+            if (w == 1) {
+                hasD1 = true;
+            } else if (w == 2) {
+                hasD2 = true;
+            } else if (w == 3 || w == 4) {
+                hasD4 = true;
+            }
+
+            pjtSet.add(vo.getVOrder());
+            displnNmSet.add(vo.getViewDisplnNm());
+            displnCdSet.add(vo.getViewDisplnCd());
+        }
+
+        int m = pjtSet.size();
+        String displnNm = join(displnNmSet, "/");
+        String displnCd = join(displnCdSet, ",");
+
+        /* ---------- 메일 유형 판정 ----------
+         *   1건            → 단건 (ITEM / KEYTASK)
+         *   2건 이상 + 1PJT → DIGEST
+         *   2건 이상 + 2PJT → MULTI
+         */
+        String mailType;
+        if (n == 1) {
+            mailType = myList.get(0).isKeyTask() ? "KEYTASK" : "ITEM";
+        } else if (m >= 2) {
+            mailType = "MULTI";
+        } else {
+            mailType = "DIGEST";
+        }
+
+        /* ---------- 제목 / 본문 생성 ---------- */
+        String title;
+        String body;
+
+        if ("ITEM".equals(mailType) || "KEYTASK".equals(mailType)) {
+            EepAlertItemVo vo = myList.get(0);
+            title = makeSingleTitle(vo);
+            body  = makeSingleBody(vo);
+        } else if ("DIGEST".equals(mailType)) {
+            title = makeDigestTitle(hasD1, hasD2, hasD4, false, first(pjtSet), m, n);
+            body  = makeDigestBody(myList, displnNm, n, immd, rcvy, erly);
+        } else {
+            title = makeDigestTitle(hasD1, hasD2, hasD4, true, first(pjtSet), m, n);
+            body  = makeMultiBody(myList, displnNm, m, n, immd, rcvy, erly);
+        }
+
+        /* ---------- 로그 마스터 INSERT ---------- */
+        Map<String, Object> logParam = new HashMap<String, Object>();
+        logParam.put("batchDt", batchDt);
+        logParam.put("rcvrEmpno", empno);
+        logParam.put("rcvrNm", str(rcvrInfo.get("hname")));
+        logParam.put("rcvrGbn", str(rcvrInfo.get("recvGbn")));
+        logParam.put("rcvrDeptNm", str(rcvrInfo.get("sdeptnm")));
+        logParam.put("rcvrDisplnCd", displnCd);
+        logParam.put("rcvrDisplnNm", displnNm);
+        logParam.put("mailType", mailType);
+        logParam.put("mailLang", str(rcvrInfo.get("mailLang")));
+        logParam.put("pjtCnt", Integer.valueOf(m));
+        logParam.put("itemCnt", Integer.valueOf(n));
+        logParam.put("immdCnt", Integer.valueOf(immd));
+        logParam.put("rcvyCnt", Integer.valueOf(rcvy));
+        logParam.put("erlyCnt", Integer.valueOf(erly));
+        logParam.put("mailTitle", cutByBytes(title, TITLE_MAX_BYTES));
+        logParam.put("mailBody", cutByBytes(body, BODY_MAX_BYTES));
+
+        sqlTemplate.update(SQL + "insertEepPriNotiLog", logParam);
+
+        Object logSeqObj = logParam.get("logSeq");
+        long logSeq = (logSeqObj instanceof Number) ? ((Number) logSeqObj).longValue() : 0L;
+
+        /* ---------- 로그 상세 INSERT ---------- */
+        int itemNo = 1;
+        for (EepAlertItemVo vo : myList) {
+            Map<String, Object> dtlParam = new HashMap<String, Object>();
+            dtlParam.put("logSeq", Long.valueOf(logSeq));
+            dtlParam.put("itemNo", Integer.valueOf(itemNo));
+            dtlParam.put("pjtNo", vo.getPjtNo());
+            dtlParam.put("vOrder", vo.getVOrder());
+            dtlParam.put("priSeq", vo.getPriSeq());
+            dtlParam.put("mngItemNo", vo.getMngItemNo());
+            dtlParam.put("priMngItemNm", vo.getPriMngItemNm());
+            dtlParam.put("mstDisplnCd", vo.getMstDisplnCd());
+            dtlParam.put("mstDisplnNm", vo.getMstDisplnNm());
+            dtlParam.put("priDtlSeq", vo.getPriDtlSeq());
+            dtlParam.put("priMngItemSubNm", vo.getPriMngItemSubNm());
+            dtlParam.put("majDisplnCd", vo.getMajDisplnCd());
+            dtlParam.put("displnNm", vo.getDisplnNm());
+            dtlParam.put("ownerGbn", vo.getOwnerGbn());
+            dtlParam.put("planDt", vo.getPlanDt());
+            dtlParam.put("weeksBefore", Integer.valueOf(vo.getWeeksBefore()));
+            dtlParam.put("ver", vo.getVer());
+            dtlParam.put("dsnComp", vo.getViewComp());
+            dtlParam.put("compLimit", Integer.valueOf(vo.getCompLimit()));
+            dtlParam.put("actionLvl", vo.getActionLvl());
+            dtlParam.put("stageNm", vo.getStageNm());
+            dtlParam.put("statusNm", vo.getStatusNm());
+            dtlParam.put("actionNm", vo.getActionNm());
+
+            sqlTemplate.update(SQL + "insertEepPriNotiLogDtl", dtlParam);
+            itemNo++;
+        }
+
+        /* ---------- 실제 메일 발송 (검증 완료 후 활성화) ---------- */
+        /*
+        Map<String, Object> mailParam = new HashMap<String, Object>();
+        mailParam.put("sender_ep_id", SENDER_EP_ID);
+        mailParam.put("title", title);
+        mailParam.put("contents", body);
+
+        List<String> rcvEmpList = new ArrayList<String>();
+        rcvEmpList.add(empno);
+        mailParam.put("rcvList", rcvEmpList);
+
+        // 개발자, PI 비밀참조
+        Map<String, Object> secretRcvMap = new HashMap<String, Object>();
+        secretRcvMap.put("20070724", "Y"); // 구서영
+        secretRcvMap.put("20110747", "Y"); // 유병철
+        secretRcvMap.put("T13621", "Y");   // 한승동
+        secretRcvMap.put("T08722", "Y");   // 김동진
+        mailParam.put("secretRcvMap", secretRcvMap);
+
+        batchMaillingService.registerMail(mailParam);
+        */
+    }
+
+    /* ============================================================
+     *  제목 생성
+     * ============================================================ */
+
+    /** 단건 제목 */
+    private String makeSingleTitle(EepAlertItemVo vo) {
+        String tmpl = EepMailTemplate.pickSingleSubject(vo.isKeyTask(), vo.getWeeksBefore(), vo.getVer());
+
+        Map<String, String> p = new HashMap<String, String>();
+        p.put("PJT", vo.getVOrder());
+        p.put("ITEM_NM", vo.getPriMngItemSubNm());
+        p.put("KEYTASK_NM", vo.getPriMngItemNm());
+
+        return EepMailTemplate.render(tmpl, p);
+    }
+
+    /** Digest / MultiProject 제목 */
+    private String makeDigestTitle(boolean hasD1, boolean hasD2, boolean hasD4,
+                                   boolean isMulti, String pjtNm, int m, int n) {
+        String tmpl = EepMailTemplate.pickDigestSubject(hasD1, hasD2, hasD4, isMulti);
+
+        Map<String, String> p = new HashMap<String, String>();
+        p.put("PJT", pjtNm);
+        p.put("M", String.valueOf(m));
+        p.put("N", String.valueOf(n));
+
+        return EepMailTemplate.render(tmpl, p);
+    }
+
+    /* ============================================================
+     *  본문 생성
+     * ============================================================ */
+
+    /** 단건 본문 */
+    private String makeSingleBody(EepAlertItemVo vo) {
+        String tmpl;
+
+        if (vo.isKeyTask()) {
+            /* KeyTask Owner
+             *   D-6/4/2 : 지연 관리항목이 본인 소관 공종인지
+             *   D-1     : Key Task가 단일 공종인지 (※ 현업 확인 대기 항목)
+             *   현재는 마스터 공종 == 상세 공종 여부로 판정
+             */
+            boolean ownScope = vo.getMstDisplnCd().equals(vo.getMajDisplnCd());
+            tmpl = EepMailBody.pickKeyTaskBody(vo.getWeeksBefore(), vo.getVer(), ownScope);
+        } else {
+            /* Item Owner : Key Task 공종 == 관리항목 공종 (LE=본인) */
+            boolean sameDispln = vo.getMstDisplnCd().equals(vo.getMajDisplnCd());
+            tmpl = EepMailBody.pickItemBody(vo.getWeeksBefore(), vo.getVer(), sameDispln);
+        }
+
+        Map<String, String> p = new HashMap<String, String>();
+        p.put("ITEM_NM", EepMailTemplate.esc(vo.getPriMngItemSubNm()));
+        p.put("KEYTASK_NM", EepMailTemplate.esc(vo.getPriMngItemNm()));
+        p.put("DELAY_ITEM_NM", EepMailTemplate.esc(vo.getPriMngItemSubNm()));
+        p.put("DELAY_SCOPE", vo.getMstDisplnCd().equals(vo.getMajDisplnCd()) ? "본인 소관" : "타 공종 소관");
+
+        String inner = EepMailTemplate.render(tmpl, p);
+        String head  = EepMailBody.pickHead(vo.getWeeksBefore(), vo.getVer());
+
+        return EepMailTemplate.wrap(head, inner);
+    }
+
+    /** Digest 본문 (단일 프로젝트) */
+    private String makeDigestBody(List<EepAlertItemVo> myList, String displnNm,
+                                  int n, int immd, int rcvy, int erly) {
+
+        Map<String, String> p = new HashMap<String, String>();
+        p.put("DISPLN_NM", EepMailTemplate.esc(displnNm));
+        p.put("N", String.valueOf(n));
+        p.put("X", String.valueOf(immd));
+        p.put("Y", String.valueOf(rcvy));
+        p.put("Z", String.valueOf(erly));
+        p.put("TABLE", EepMailTable.build(myList, false, 1));
+
+        String inner = EepMailTemplate.render(EepMailBody.KR_DIGEST, p);
+        return EepMailTemplate.wrap(EepMailTemplate.HEAD_DIGEST, inner);
+    }
+
+    /** MultiProject Digest 본문 (프로젝트별 섹션 반복) */
+    private String makeMultiBody(List<EepAlertItemVo> myList, String displnNm,
+                                 int m, int n, int immd, int rcvy, int erly) {
+
+        /* 프로젝트별로 묶기. myList는 이미 우선순위 순으로 정렬되어 있으므로
+         * LinkedHashMap을 쓰면 리스크가 높은 프로젝트가 자연스럽게 위로 온다. */
+        Map<String, List<EepAlertItemVo>> pjtMap = new LinkedHashMap<String, List<EepAlertItemVo>>();
+        for (EepAlertItemVo vo : myList) {
+            String pjtNm = vo.getVOrder();
+            List<EepAlertItemVo> bucket = pjtMap.get(pjtNm);
+            if (bucket == null) {
+                bucket = new ArrayList<EepAlertItemVo>();
+                pjtMap.put(pjtNm, bucket);
+            }
+            bucket.add(vo);
+        }
+
+        StringBuilder sections = new StringBuilder(8192);
+        for (Map.Entry<String, List<EepAlertItemVo>> e : pjtMap.entrySet()) {
+            List<EepAlertItemVo> sub = e.getValue();
+            sections.append(EepMailTable.section(e.getKey(), sub.size()));
+            sections.append(EepMailTable.build(sub, false, 1));
+        }
+
+        Map<String, String> p = new HashMap<String, String>();
+        p.put("DISPLN_NM", EepMailTemplate.esc(displnNm));
+        p.put("M", String.valueOf(m));
+        p.put("N", String.valueOf(n));
+        p.put("X", String.valueOf(immd));
+        p.put("Y", String.valueOf(rcvy));
+        p.put("Z", String.valueOf(erly));
+        p.put("SECTIONS", sections.toString());
+
+        String inner = EepMailTemplate.render(EepMailBody.KR_MULTI, p);
+        return EepMailTemplate.wrap(EepMailTemplate.HEAD_DIGEST, inner);
+    }
+
+    /* ============================================================
+     *  util
+     * ============================================================ */
+
+    private String str(Object o) {
+        return o == null ? "" : String.valueOf(o);
+    }
+
+    private String first(Set<String> set) {
+        for (String s : set) {
+            return s;
+        }
+        return "";
+    }
+
+    private String join(Set<String> set, String sep) {
+        StringBuilder sb = new StringBuilder();
+        for (String s : set) {
+            if (s == null || s.length() == 0) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(sep);
+            }
+            sb.append(s);
+        }
+        return sb.toString();
+    }
+
+    /** UTF-8 바이트 기준으로 자르고 넘치면 "..." 붙임 (한글 경계 안전) */
+    private String cutByBytes(String src, int maxBytes) {
+        if (src == null) {
+            return null;
+        }
+        byte[] bytes;
+        try {
+            bytes = src.getBytes("UTF-8");
+        } catch (UnsupportedEncodingException e) {
             return src;
         }
-        StringBuilder sb = new StringBuilder(src.length());
-        int pos = 0;
-        while (true) {
-            int idx = src.indexOf(from, pos);
-            if (idx < 0) {
-                sb.append(src.substring(pos));
-                break;
-            }
-            sb.append(src, pos, idx).append(to);
-            pos = idx + from.length();
-        }
-        return sb.toString();
-    }
-
-    /** HTML 이스케이프 */
-    public static String esc(String s) {
-        if (s == null || s.length() == 0) {
-            return "";
-        }
-        StringBuilder sb = new StringBuilder(s.length() + 16);
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (c == '&') {
-                sb.append("&amp;");
-            } else if (c == '<') {
-                sb.append("&lt;");
-            } else if (c == '>') {
-                sb.append("&gt;");
-            } else if (c == '"') {
-                sb.append("&quot;");
-            } else {
-                sb.append(c);
-            }
-        }
-        return sb.toString();
-    }
-
-    public static String nvl(String s) {
-        return s == null ? "" : s;
-    }
-
-    /* ============================================================
-     *  메일 제목 (KR) - Alert_Settings No.1~10 + Digest / MultiProject
-     * ============================================================ */
-
-    /* --- 단건: 관리항목 담당자 (Item Owner) --- */
-    public static final String KR_SUBJ_ITEM_D6 =
-        "[Risk Warning] [Project: {{PJT}}] [관리항목: {{ITEM_NM}}] – 진도 관리 필요 – 조기 점검 요청";
-    public static final String KR_SUBJ_ITEM_D4 =
-        "[Risk Warning] [Project: {{PJT}}] [관리항목: {{ITEM_NM}}] – 진도 관리 필요 – 만회 조치 요청";
-    public static final String KR_SUBJ_ITEM_D2 =
-        "[Risk Warning] [Project: {{PJT}}] [관리항목: {{ITEM_NM}}] – 진도 관리 필요 – 즉시 조치 필요";
-    public static final String KR_SUBJ_ITEM_D1V1 =
-        "[Risk Warning] [Project: {{PJT}}] [관리항목: {{ITEM_NM}}] – D-1주 – 품질·일정 리스크";
-    public static final String KR_SUBJ_ITEM_D1V2 =
-        "[Notice] [Project: {{PJT}}] [관리항목: {{ITEM_NM}}] – D-1주 – 최종 점검 필요";
-
-    /* --- 단건: Key Task 담당 --- */
-    public static final String KR_SUBJ_KT_D6 =
-        "[Risk Warning] [Project: {{PJT}}] [Key Task: {{KEYTASK_NM}}] – 진도 관리 필요 – 조기 점검 요청";
-    public static final String KR_SUBJ_KT_D4 =
-        "[Risk Warning] [Project: {{PJT}}] [Key Task: {{KEYTASK_NM}}] – 진도 관리 필요 – 만회 조치 요청";
-    public static final String KR_SUBJ_KT_D2 =
-        "[Risk Warning] [Project: {{PJT}}] [Key Task: {{KEYTASK_NM}}] – 진도 관리 필요 – 즉시 조치 필요";
-    public static final String KR_SUBJ_KT_D1V1 =
-        "[Risk Warning] [Project: {{PJT}}] [Key Task: {{KEYTASK_NM}}] – D-1주 – 품질·일정 리스크";
-    public static final String KR_SUBJ_KT_D1V2 =
-        "[Notice] [Project: {{PJT}}] [Key Task: {{KEYTASK_NM}}] – D-1주 – 최종 점검 필요";
-
-    /* --- Digest (단일 프로젝트) --- */
-    public static final String KR_SUBJ_DIGEST_IMMD =
-        "[Risk Warning] [Project: {{PJT}}] 금일 확인 필요 항목 {{N}}건 (즉시조치 포함)";
-    public static final String KR_SUBJ_DIGEST_RCVY =
-        "[Risk Warning] [Project: {{PJT}}] 금일 확인 필요 항목 {{N}}건 (만회조치 필요)";
-    public static final String KR_SUBJ_DIGEST_ERLY =
-        "[Risk Warning] [Project: {{PJT}}] 금일 확인 필요 항목 {{N}}건 (조기점검)";
-    public static final String KR_SUBJ_DIGEST_NEAR =
-        "[Risk Warning] [Project: {{PJT}}] 금일 확인 필요 항목 {{N}}건 – 완료 임박 포함";
-
-    /* --- MultiProject Digest --- */
-    public static final String KR_SUBJ_MULTI_IMMD =
-        "[Risk Warning] [담당 프로젝트 {{M}}건] 금일 확인 필요 항목 {{N}}건 (즉시조치 포함)";
-    public static final String KR_SUBJ_MULTI_RCVY =
-        "[Risk Warning] [담당 프로젝트 {{M}}건] 금일 확인 필요 항목 {{N}}건 (만회조치 필요)";
-    public static final String KR_SUBJ_MULTI_ERLY =
-        "[Risk Warning] [담당 프로젝트 {{M}}건] 금일 확인 필요 항목 {{N}}건 (조기점검)";
-    public static final String KR_SUBJ_MULTI_NEAR =
-        "[Risk Warning] [담당 프로젝트 {{M}}건] 금일 확인 필요 항목 {{N}}건 – 완료 임박 포함";
-
-    /* ============================================================
-     *  제목 선택
-     * ============================================================ */
-
-    /** 단건 제목 선택 */
-    public static String pickSingleSubject(boolean isKeyTask, int weeksBefore, String ver) {
-        if (isKeyTask) {
-            if (weeksBefore == 1) {
-                return "V2".equals(ver) ? KR_SUBJ_KT_D1V2 : KR_SUBJ_KT_D1V1;
-            } else if (weeksBefore == 2) {
-                return KR_SUBJ_KT_D2;
-            } else if (weeksBefore == 3 || weeksBefore == 4) {
-                return KR_SUBJ_KT_D4;
-            }
-            return KR_SUBJ_KT_D6;
+        if (bytes.length <= maxBytes) {
+            return src;
         }
 
-        if (weeksBefore == 1) {
-            return "V2".equals(ver) ? KR_SUBJ_ITEM_D1V2 : KR_SUBJ_ITEM_D1V1;
-        } else if (weeksBefore == 2) {
-            return KR_SUBJ_ITEM_D2;
-        } else if (weeksBefore == 3 || weeksBefore == 4) {
-            return KR_SUBJ_ITEM_D4;
+        int limit = maxBytes - 3; // "..." 자리 확보
+        // UTF-8 연속바이트(10xxxxxx) 위면 문자 시작 지점까지 뒤로
+        while (limit > 0 && (bytes[limit] & 0xC0) == 0x80) {
+            limit--;
         }
-        return KR_SUBJ_ITEM_D6;
-    }
 
-    /**
-     * Digest / MultiProject 제목 선택 (계단식)
-     * D-1주 있으면 완료임박 > D-2 즉시조치 > D-4/3 만회조치 > D-6/5 조기점검
-     */
-    public static String pickDigestSubject(boolean hasD1, boolean hasD2, boolean hasD4, boolean isMulti) {
-        if (hasD1) {
-            return isMulti ? KR_SUBJ_MULTI_NEAR : KR_SUBJ_DIGEST_NEAR;
-        } else if (hasD2) {
-            return isMulti ? KR_SUBJ_MULTI_IMMD : KR_SUBJ_DIGEST_IMMD;
-        } else if (hasD4) {
-            return isMulti ? KR_SUBJ_MULTI_RCVY : KR_SUBJ_DIGEST_RCVY;
+        try {
+            return new String(bytes, 0, limit, "UTF-8") + "...";
+        } catch (UnsupportedEncodingException e) {
+            return src;
         }
-        return isMulti ? KR_SUBJ_MULTI_ERLY : KR_SUBJ_DIGEST_ERLY;
     }
 }
 
@@ -283,596 +572,116 @@ public class EepMailTemplate {
 
 
 
-
-
-
-
-
-
-
-
-package com.secl.pms.batch.legacy.template;
-
-/**
- * EEP 알림 메일 본문 템플릿 (KR)
- * 시점(D-6/D-4/D-2/D-1V1/D-1V2) × 케이스 2종
- * D-5는 D-6, D-3은 D-4 템플릿 재사용
- */
-public class EepMailBody {
-
-    private EepMailBody() {
-    }
-
-    private static final String P  = "<p style=\"" + EepMailTemplate.S_P + "\">";
-    private static final String PE = "</p>";
-
-    /** 정보 박스 - Key Task 담당자 줄 포함 (LE≠본인) */
-    private static final String BOX_ITEM_WITH_LE =
-          "<div style=\"" + EepMailTemplate.S_INFOBOX + "\">"
-        + "<p style=\"" + EepMailTemplate.S_INFO_ROW + "\">"
-        + "<span style=\"" + EepMailTemplate.S_INFO_LABEL + "\">관리항목</span>{{ITEM_NM}}</p>"
-        + "<p style=\"" + EepMailTemplate.S_INFO_ROW + "\">"
-        + "<span style=\"" + EepMailTemplate.S_INFO_LABEL + "\">관련 Key Task</span>{{KEYTASK_NM}}</p>"
-        + "<p style=\"" + EepMailTemplate.S_INFO_ROW_LAST + "\">"
-        + "<span style=\"" + EepMailTemplate.S_INFO_LABEL + "\">Key Task 담당자</span>프로젝트 LE</p>"
-        + "</div>";
-
-    /** 정보 박스 - Key Task 담당자 줄 없음 (LE=본인) */
-    private static final String BOX_ITEM_SELF =
-          "<div style=\"" + EepMailTemplate.S_INFOBOX + "\">"
-        + "<p style=\"" + EepMailTemplate.S_INFO_ROW + "\">"
-        + "<span style=\"" + EepMailTemplate.S_INFO_LABEL + "\">관리항목</span>{{ITEM_NM}}</p>"
-        + "<p style=\"" + EepMailTemplate.S_INFO_ROW_LAST + "\">"
-        + "<span style=\"" + EepMailTemplate.S_INFO_LABEL + "\">관련 Key Task</span>{{KEYTASK_NM}}</p>"
-        + "</div>";
-
-    /** 정보 박스 - Key Task Owner용 (지연 관리항목 명시) */
-    private static final String BOX_KT_WITH_ITEM =
-          "<div style=\"" + EepMailTemplate.S_INFOBOX + "\">"
-        + "<p style=\"" + EepMailTemplate.S_INFO_ROW + "\">"
-        + "<span style=\"" + EepMailTemplate.S_INFO_LABEL + "\">Key Task</span>{{KEYTASK_NM}}</p>"
-        + "<p style=\"" + EepMailTemplate.S_INFO_ROW + "\">"
-        + "<span style=\"" + EepMailTemplate.S_INFO_LABEL + "\">특히 지연 중인 관리항목</span>{{DELAY_ITEM_NM}} ({{DELAY_SCOPE}})</p>"
-        + "<p style=\"" + EepMailTemplate.S_INFO_ROW_LAST + "\">"
-        + "<span style=\"" + EepMailTemplate.S_INFO_LABEL + "\">담당</span>팀장 / LE</p>"
-        + "</div>";
-
-    /** 정보 박스 - Key Task Owner용 (D-1주, 관리항목명 없음) */
-    private static final String BOX_KT_ONLY =
-          "<div style=\"" + EepMailTemplate.S_INFOBOX + "\">"
-        + "<p style=\"" + EepMailTemplate.S_INFO_ROW + "\">"
-        + "<span style=\"" + EepMailTemplate.S_INFO_LABEL + "\">Key Task</span>{{KEYTASK_NM}}</p>"
-        + "<p style=\"" + EepMailTemplate.S_INFO_ROW_LAST + "\">"
-        + "<span style=\"" + EepMailTemplate.S_INFO_LABEL + "\">담당</span>팀장 / LE</p>"
-        + "</div>";
-
-    /* ============================================================
-     *  Body_Item_Owner (관리항목 담당자)
-     * ============================================================ */
-
-    /* --- D-6주 (D-5 재사용) --- */
-    public static final String KR_ITEM_D6_OTHER =
-          P + "담당하고 계신 관리항목 \"{{ITEM_NM}}\"의 진행율이 저조한 것으로 감지되었습니다." + PE
-        + P + "본 항목은 Key Task \"{{KEYTASK_NM}}\"의 설계완성도를 구성하는 항목 중 하나로, "
-            + "지연이 지속될 경우 해당 Key Task 전체 일정에 영향을 줄 수 있습니다." + PE
-        + BOX_ITEM_WITH_LE
-        + P + "조기 점검 및 완료 조치 부탁드리며, 필요시 프로젝트 LE와 협의해 주시기 바랍니다." + PE;
-
-    public static final String KR_ITEM_D6_SELF =
-          P + "담당하고 계신 관리항목 \"{{ITEM_NM}}\"의 진행율이 저조한 것으로 감지되었습니다." + PE
-        + P + "본 항목은 Key Task \"{{KEYTASK_NM}}\"의 설계완성도를 구성하는 항목 중 하나로, "
-            + "지연이 지속될 경우 해당 Key Task 전체 일정에 영향을 줄 수 있습니다." + PE
-        + BOX_ITEM_SELF
-        + P + "조기 점검 및 완료 조치가 필요합니다." + PE;
-
-    /* --- D-4주 (D-3 재사용) --- */
-    public static final String KR_ITEM_D4_OTHER =
-          P + "담당하고 계신 관리항목 \"{{ITEM_NM}}\"의 진행율 저조가 지속되고 있는 것으로 감지되었습니다." + PE
-        + P + "본 항목은 Key Task \"{{KEYTASK_NM}}\"의 설계완성도에 직접 영향을 미치고 있으며, "
-            + "해당 Key Task는 타 Task와도 연계되어 있어 파급 영향이 우려되는 단계입니다." + PE
-        + BOX_ITEM_WITH_LE
-        + P + "지체 없이 완료 조치해 주시기 바라며, 프로젝트 LE와 협의하여 진행해 주십시오." + PE;
-
-    public static final String KR_ITEM_D4_SELF =
-          P + "담당하고 계신 관리항목 \"{{ITEM_NM}}\"의 진행율 저조가 지속되고 있는 것으로 감지되었습니다." + PE
-        + P + "본 항목은 Key Task \"{{KEYTASK_NM}}\"의 설계완성도에 직접 영향을 미치고 있으며, "
-            + "해당 Key Task는 타 Task와도 연계되어 있어 파급 영향이 우려되는 단계입니다." + PE
-        + BOX_ITEM_SELF
-        + P + "지체 없이 완료 조치가 필요합니다." + PE;
-
-    /* --- D-2주 --- */
-    public static final String KR_ITEM_D2_OTHER =
-          P + "Key Task \"{{KEYTASK_NM}}\" 완료 예정일이 임박한 시점에서, "
-            + "담당하고 계신 관리항목 \"{{ITEM_NM}}\"의 진행율 저조가 해소되지 않고 있는 것으로 감지되었습니다." + PE
-        + P + "이 상태가 지속될 경우 Key Task 및 연계된 타 Task의 일정·품질에 "
-            + "직접적인 영향이 발생할 수 있는 높은 위험 단계입니다." + PE
-        + BOX_ITEM_WITH_LE
-        + P + "즉시 완료 조치가 필요하며, 프로젝트 LE와 반드시 협의하여 진행해 주시기 바랍니다. "
-            + "본 알람은 프로젝트 LE에게도 동시 발송됩니다." + PE;
-
-    public static final String KR_ITEM_D2_SELF =
-          P + "Key Task \"{{KEYTASK_NM}}\" 완료 예정일이 임박한 시점에서, "
-            + "담당하고 계신 관리항목 \"{{ITEM_NM}}\"의 진행율 저조가 해소되지 않고 있는 것으로 감지되었습니다." + PE
-        + P + "이 상태가 지속될 경우 Key Task 및 연계된 타 Task의 일정·품질에 "
-            + "직접적인 영향이 발생할 수 있는 높은 위험 단계입니다." + PE
-        + BOX_ITEM_SELF
-        + P + "즉시 완료 조치가 필요합니다." + PE;
-
-    /* --- D-1주 버전1 (≤80%) --- */
-    public static final String KR_ITEM_D1V1_OTHER =
-          P + "완료 예정일을 1주일 앞둔 시점에서, 담당하고 계신 관리항목 \"{{ITEM_NM}}\"의 "
-            + "진행율이 여전히 낮은 수준인 것으로 감지되었습니다." + PE
-        + P + "이 시점에서의 낮은 진행율은 단순 지연이 아니라 품질 미흡으로 이어져 "
-            + "결과적으로 일정 문제까지 유발할 수 있는 위험 신호입니다." + PE
-        + BOX_ITEM_WITH_LE
-        + P + "즉시 완료 조치가 필요하며, 프로젝트 LE와 반드시 협의하여 진행해 주시기 바랍니다." + PE;
-
-    public static final String KR_ITEM_D1V1_SELF =
-          P + "완료 예정일을 1주일 앞둔 시점에서, 담당하고 계신 관리항목 \"{{ITEM_NM}}\"의 "
-            + "진행율이 여전히 낮은 수준인 것으로 감지되었습니다." + PE
-        + P + "이 시점에서의 낮은 진행율은 단순 지연이 아니라 품질 미흡으로 이어져 "
-            + "결과적으로 일정 문제까지 유발할 수 있는 위험 신호입니다." + PE
-        + BOX_ITEM_SELF
-        + P + "즉시 완료 조치가 필요합니다." + PE;
-
-    /* --- D-1주 버전2 (80~100%) --- */
-    public static final String KR_ITEM_D1V2_OTHER =
-          P + "완료 예정일을 1주일 앞둔 시점에서, 담당하고 계신 관리항목 \"{{ITEM_NM}}\"이 "
-            + "완료(100%)에는 도달하지 못한 것으로 확인되었습니다." + PE
-        + P + "대부분 진행되었으나 아직 완료 상태가 아니므로, "
-            + "마무리 전 누락 사항이 없는지 한 번 더 살펴보실 필요가 있습니다." + PE
-        + BOX_ITEM_WITH_LE
-        + P + "완료 전 최종 점검을 부탁드리며, 필요시 프로젝트 LE와 확인해 주시기 바랍니다." + PE;
-
-    public static final String KR_ITEM_D1V2_SELF =
-          P + "완료 예정일을 1주일 앞둔 시점에서, 담당하고 계신 관리항목 \"{{ITEM_NM}}\"이 "
-            + "완료(100%)에는 도달하지 못한 것으로 확인되었습니다." + PE
-        + P + "대부분 진행되었으나 아직 완료 상태가 아니므로, "
-            + "마무리 전 누락 사항이 없는지 한 번 더 살펴보실 필요가 있습니다." + PE
-        + BOX_ITEM_SELF
-        + P + "완료 전 최종 점검이 필요합니다." + PE;
-
-    /* ============================================================
-     *  Body_KeyTask_Owner (Key Task 담당)
-     * ============================================================ */
-
-    /* --- D-6주 (D-5 재사용) --- */
-    public static final String KR_KT_D6_OTHER =
-          P + "Key Task \"{{KEYTASK_NM}}\"의 설계완성도 전체 진행율이 저조한 것으로 감지되었습니다." + PE
-        + P + "특히, 하위 관리항목 중 \"{{DELAY_ITEM_NM}}\"의 지연이 두드러지며, "
-            + "이는 Key Task 전체 일정에 영향을 줄 수 있습니다. "
-            + "해당 Key Task는 타 Key Task와도 상호 연계되어 있어 지연 지속 시 연관 Task로 파급될 수 있습니다." + PE
-        + BOX_KT_WITH_ITEM
-        + P + "조기 점검 부탁드리며, 필요시 해당 관리항목 담당자와 협의해 주시기 바랍니다." + PE;
-
-    public static final String KR_KT_D6_SELF =
-          P + "Key Task \"{{KEYTASK_NM}}\"의 설계완성도 전체 진행율이 저조한 것으로 감지되었습니다." + PE
-        + P + "특히, 하위 관리항목 중 \"{{DELAY_ITEM_NM}}\"의 지연이 두드러지며, "
-            + "이는 Key Task 전체 일정에 영향을 줄 수 있습니다. 해당 항목은 본인 소관 공종에 해당합니다." + PE
-        + BOX_KT_WITH_ITEM
-        + P + "조기 점검 및 조치를 직접 진행해 주시기 바랍니다." + PE;
-
-    /* --- D-4주 (D-3 재사용) --- */
-    public static final String KR_KT_D4_OTHER =
-          P + "Key Task \"{{KEYTASK_NM}}\"의 전체 진행율 저조가 지속되고 있는 것으로 감지되었습니다." + PE
-        + P + "특히, \"{{DELAY_ITEM_NM}}\"의 지연이 해소되지 않고 있으며, "
-            + "상호 연계된 타 Key Task로 일정·품질 영향이 확산될 위험이 커지고 있습니다." + PE
-        + BOX_KT_WITH_ITEM
-        + P + "지체 없이 만회 조치를 진행해 주시기 바라며, 해당 관리항목 담당자와 협의하여 추진해 주십시오." + PE;
-
-    public static final String KR_KT_D4_SELF =
-          P + "Key Task \"{{KEYTASK_NM}}\"의 전체 진행율 저조가 지속되고 있는 것으로 감지되었습니다." + PE
-        + P + "특히, \"{{DELAY_ITEM_NM}}\"의 지연이 해소되지 않고 있으며, "
-            + "상호 연계된 타 Key Task로 일정·품질 영향이 확산될 위험이 커지고 있습니다. "
-            + "해당 항목은 본인 소관 공종에 해당합니다." + PE
-        + BOX_KT_WITH_ITEM
-        + P + "지체 없이 직접 만회 조치를 진행해 주시기 바랍니다." + PE;
-
-    /* --- D-2주 --- */
-    public static final String KR_KT_D2_OTHER =
-          P + "완료 예정일이 임박한 시점에서 Key Task \"{{KEYTASK_NM}}\"의 "
-            + "전체 진행율 저조가 상당한 수준으로 지속되고 있는 것으로 감지되었습니다." + PE
-        + P + "특히, \"{{DELAY_ITEM_NM}}\"의 지연이 해소되지 않고 있으며, "
-            + "본 Task와 상호 연계된 타 Key Task의 일정 및 품질에 직접적인 영향이 발생할 위험이 높은 단계입니다." + PE
-        + BOX_KT_WITH_ITEM
-        + P + "즉시 검토 및 조치가 필요하며, 해당 관리항목 담당자와 반드시 협의하여 추진해 주시기 바랍니다." + PE;
-
-    public static final String KR_KT_D2_SELF =
-          P + "완료 예정일이 임박한 시점에서 Key Task \"{{KEYTASK_NM}}\"의 "
-            + "전체 진행율 저조가 상당한 수준으로 지속되고 있는 것으로 감지되었습니다." + PE
-        + P + "특히, \"{{DELAY_ITEM_NM}}\"의 지연이 해소되지 않고 있으며, "
-            + "본 Task와 상호 연계된 타 Key Task의 일정 및 품질에 직접적인 영향이 발생할 위험이 높은 단계입니다. "
-            + "해당 항목은 본인 소관 공종에 해당합니다." + PE
-        + BOX_KT_WITH_ITEM
-        + P + "즉시 직접 검토 및 조치를 진행해 주시기 바랍니다." + PE;
-
-    /* --- D-1주 버전1 (≤80%) : 복수 공종 혼재 / 단일 공종 --- */
-    public static final String KR_KT_D1V1_MULTI =
-          P + "완료 예정일을 1주일 앞둔 시점에서, Key Task \"{{KEYTASK_NM}}\"의 "
-            + "전체 진행율이 여전히 낮은 수준인 것으로 감지되었습니다." + PE
-        + P + "이 시점에서의 낮은 진행율은 품질 미흡으로 이어져 결과적으로 일정 문제까지 유발할 수 있는 "
-            + "위험 신호이며, 상호 연계된 타 Key Task로도 영향이 파급될 수 있습니다." + PE
-        + BOX_KT_ONLY
-        + P + "즉시 검토 및 조치가 필요하며, 관련 관리항목 담당자들과 반드시 협의하여 추진해 주시기 바랍니다." + PE;
-
-    public static final String KR_KT_D1V1_SINGLE =
-          P + "완료 예정일을 1주일 앞둔 시점에서, Key Task \"{{KEYTASK_NM}}\"의 "
-            + "전체 진행율이 여전히 낮은 수준인 것으로 감지되었습니다." + PE
-        + P + "이 시점에서의 낮은 진행율은 품질 미흡으로 이어져 결과적으로 일정 문제까지 유발할 수 있는 "
-            + "위험 신호이며, 상호 연계된 타 Key Task로도 영향이 파급될 수 있습니다. "
-            + "본 Key Task는 본인 소관 공종으로만 구성되어 있습니다." + PE
-        + BOX_KT_ONLY
-        + P + "즉시 직접 검토 및 조치를 진행해 주시기 바랍니다." + PE;
-
-    /* --- D-1주 버전2 (80~100%) --- */
-    public static final String KR_KT_D1V2_MULTI =
-          P + "완료 예정일을 1주일 앞둔 시점에서, Key Task \"{{KEYTASK_NM}}\"가 "
-            + "완료(100%)에는 도달하지 못한 것으로 확인되었습니다." + PE
-        + P + "대부분 진행되었으나 아직 완료 상태가 아니므로, "
-            + "마무리 전 누락 사항이 없는지 한 번 더 살펴보실 필요가 있습니다." + PE
-        + BOX_KT_ONLY
-        + P + "완료 전 최종 점검을 부탁드리며, 필요시 관련 관리항목 담당자들과 확인해 주시기 바랍니다." + PE;
-
-    public static final String KR_KT_D1V2_SINGLE =
-          P + "완료 예정일을 1주일 앞둔 시점에서, Key Task \"{{KEYTASK_NM}}\"가 "
-            + "완료(100%)에는 도달하지 못한 것으로 확인되었습니다." + PE
-        + P + "대부분 진행되었으나 아직 완료 상태가 아니므로, "
-            + "마무리 전 누락 사항이 없는지 한 번 더 살펴보실 필요가 있습니다. "
-            + "본 Key Task는 본인 소관 공종으로만 구성되어 있습니다." + PE
-        + BOX_KT_ONLY
-        + P + "완료 전 최종 점검을 직접 진행해 주시기 바랍니다." + PE;
-
-    /* ============================================================
-     *  Digest / MultiProject 본문
-     * ============================================================ */
-
-    /** 단일 프로젝트 Digest. {{TABLE}} 자리에 항목 표 삽입 */
-    public static final String KR_DIGEST =
-          "<div style=\"" + EepMailTemplate.S_SUMMARY + "\">"
-        + "<p style=\"" + EepMailTemplate.S_SUM_MAIN + "\">"
-        + "{{DISPLN_NM}} 공종 관련 리스크 항목이 금일 기준 총 <span style=\""
-        + EepMailTemplate.S_EM + "\">{{N}}건</span> 확인되었습니다.</p>"
-        + "<p style=\"" + EepMailTemplate.S_SUM_SUB + "\">"
-        + "즉시조치 {{X}}건 &nbsp;/&nbsp; 만회조치 {{Y}}건 &nbsp;/&nbsp; 조기점검 {{Z}}건</p>"
-        + "</div>"
-        + P + "아래 목록을 확인하시어 우선순위(가장 시급한 항목 순)에 따라 조치해 주시기 바랍니다." + PE
-        + "{{TABLE}}"
-        + P + "필요시 프로젝트 LE와 협의하여 진행해 주시기 바랍니다." + PE;
-
-    /** 복수 프로젝트 Digest. {{SECTIONS}} 자리에 프로젝트별 섹션+표 반복 삽입 */
-    public static final String KR_MULTI =
-          "<div style=\"" + EepMailTemplate.S_SUMMARY + "\">"
-        + "<p style=\"" + EepMailTemplate.S_SUM_MAIN + "\">"
-        + "관리(관할)하고 계신 <span style=\"" + EepMailTemplate.S_EM + "\">{{M}}개</span> 프로젝트의 "
-        + "{{DISPLN_NM}} 공종에서 금일 기준 총 <span style=\""
-        + EepMailTemplate.S_EM + "\">{{N}}건</span>의 리스크 항목이 확인되었습니다.</p>"
-        + "<p style=\"" + EepMailTemplate.S_SUM_SUB + "\">"
-        + "즉시조치 {{X}}건 &nbsp;/&nbsp; 만회조치 {{Y}}건 &nbsp;/&nbsp; 조기점검 {{Z}}건</p>"
-        + "</div>"
-        + P + "프로젝트별 세부 내역은 아래를 확인해 주시기 바랍니다." + PE
-        + "{{SECTIONS}}"
-        + P + "프로젝트별 현황을 점검하시고, 필요시 해당 프로젝트 LE에게 조치 여부 확인 부탁드립니다." + PE;
-
-    /* ============================================================
-     *  본문 선택
-     * ============================================================ */
-
-    /**
-     * Item Owner 단건 본문 선택
-     * @param sameDispln Key Task 공종 == 수신자 공종 (LE=본인)
-     */
-    public static String pickItemBody(int weeksBefore, String ver, boolean sameDispln) {
-        if (weeksBefore == 1) {
-            if ("V2".equals(ver)) {
-                return sameDispln ? KR_ITEM_D1V2_SELF : KR_ITEM_D1V2_OTHER;
-            }
-            return sameDispln ? KR_ITEM_D1V1_SELF : KR_ITEM_D1V1_OTHER;
-        } else if (weeksBefore == 2) {
-            return sameDispln ? KR_ITEM_D2_SELF : KR_ITEM_D2_OTHER;
-        } else if (weeksBefore == 3 || weeksBefore == 4) {
-            return sameDispln ? KR_ITEM_D4_SELF : KR_ITEM_D4_OTHER;
-        }
-        return sameDispln ? KR_ITEM_D6_SELF : KR_ITEM_D6_OTHER;
-    }
-
-    /**
-     * KeyTask Owner 단건 본문 선택
-     * @param ownScope D-6/4/2: 지연 관리항목이 본인 소관 공종인지
-     *                 D-1    : Key Task가 단일 공종(본인 총괄)인지
-     */
-    public static String pickKeyTaskBody(int weeksBefore, String ver, boolean ownScope) {
-        if (weeksBefore == 1) {
-            if ("V2".equals(ver)) {
-                return ownScope ? KR_KT_D1V2_SINGLE : KR_KT_D1V2_MULTI;
-            }
-            return ownScope ? KR_KT_D1V1_SINGLE : KR_KT_D1V1_MULTI;
-        } else if (weeksBefore == 2) {
-            return ownScope ? KR_KT_D2_SELF : KR_KT_D2_OTHER;
-        } else if (weeksBefore == 3 || weeksBefore == 4) {
-            return ownScope ? KR_KT_D4_SELF : KR_KT_D4_OTHER;
-        }
-        return ownScope ? KR_KT_D6_SELF : KR_KT_D6_OTHER;
-    }
-
-    /** 헤더 문구 선택 (D-1주 V2만 안내 알람) */
-    public static String pickHead(int weeksBefore, String ver) {
-        if (weeksBefore == 1 && "V2".equals(ver)) {
-            return EepMailTemplate.HEAD_NOTICE;
-        }
-        return EepMailTemplate.HEAD_RISK;
-    }
-}
-
-
-
-
-
-
-
-
-
-package com.secl.pms.batch.legacy.template;
-
-import java.util.List;
-
-import com.secl.pms.batch.vo.EepAlertItemVo;
-
-/**
- * Digest / MultiProject 항목 리스트 표 HTML 생성
- */
-public class EepMailTable {
-
-    private EepMailTable() {
-    }
-
-    /**
-     * 항목 리스트 표 생성
-     * @param list      정렬 완료된 항목 목록
-     * @param withPjt   프로젝트 컬럼 포함 여부 (MultiProject는 섹션 구분이므로 false 권장)
-     * @param startNo   시작 번호
-     */
-    public static String build(List<EepAlertItemVo> list, boolean withPjt, int startNo) {
-        StringBuilder sb = new StringBuilder(4096);
-
-        sb.append("<table style=\"").append(EepMailTemplate.S_TABLE).append("\">");
-        sb.append("<tr>");
-        if (withPjt) {
-            sb.append(th("프로젝트"));
-        }
-        sb.append(th("No"));
-        sb.append(th("구분"));
-        sb.append(th("명칭"));
-        sb.append(th("관련 Key Task"));
-        sb.append(th("단계"));
-        sb.append(th("상태"));
-        sb.append(th("필요 조치"));
-        sb.append("</tr>");
-
-        int no = startNo;
-        for (int i = 0; i < list.size(); i++) {
-            EepAlertItemVo vo = list.get(i);
-            sb.append("<tr>");
-            if (withPjt) {
-                sb.append(tdC(vo.getVOrder()));
-            }
-            sb.append(tdC(String.valueOf(no)));
-            sb.append(tdC(vo.getTypeNm()));
-            sb.append(td(vo.getViewName()));
-            sb.append(td(vo.getViewKeyTask()));
-            sb.append(tdC(vo.getStageNm()));
-            sb.append(td(vo.getStatusNm()));
-            sb.append(td(vo.getActionNm()));
-            sb.append("</tr>");
-            no++;
-        }
-
-        sb.append("</table>");
-        return sb.toString();
-    }
-
-    /** 프로젝트 섹션 헤더 */
-    public static String section(String pjtNm, int cnt) {
-        return "<div style=\"" + EepMailTemplate.S_SECTION + "\">"
-             + EepMailTemplate.esc(pjtNm) + " (" + cnt + "건)</div>";
-    }
-
-    private static String th(String txt) {
-        return "<th style=\"" + EepMailTemplate.S_TH + "\">" + txt + "</th>";
-    }
-
-    private static String td(String txt) {
-        return "<td style=\"" + EepMailTemplate.S_TD + "\">" + EepMailTemplate.esc(txt) + "</td>";
-    }
-
-    private static String tdC(String txt) {
-        return "<td style=\"" + EepMailTemplate.S_TD_C + "\">" + EepMailTemplate.esc(txt) + "</td>";
-    }
-}
-
-
-
-
-
-
-
-
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="UTF-8">
-<title>EEP 알림 메일 템플릿 미리보기</title>
-</head>
-<body style="margin:0;padding:0;background-color:#F0F0F0;">
-
-<!-- ============ 케이스 1: Item Owner 단건 (D-2주, LE≠본인) ============ -->
-<div style="margin:0;padding:24px 12px;background-color:#F0F0F0;font-family:'Malgun Gothic','맑은 고딕',Dotum,Arial,sans-serif;">
-<div style="max-width:760px;margin:0 auto;background-color:#FFFFFF;border:1px solid #D8D8D8;">
-<div style="padding:16px 32px;background-color:#3A3A3A;"><span style="font-size:15px;font-weight:bold;color:#FFFFFF;letter-spacing:0.5px;">[자동 리스크 알람]</span></div>
-<div style="padding:28px 32px 32px 32px;">
-<p style="margin:0 0 16px 0;font-size:14px;line-height:1.75;color:#222222;">본 메일은 설계 진도 관리 시스템에 의해 자동 발송되었습니다.</p>
-<p style="margin:0 0 16px 0;font-size:14px;line-height:1.75;color:#222222;">Key Task "P&amp;ID (IFD)" 완료 예정일이 임박한 시점에서, 담당하고 계신 관리항목 "소방 대상 Item 확정 率"의 진행율 저조가 해소되지 않고 있는 것으로 감지되었습니다.</p>
-<p style="margin:0 0 16px 0;font-size:14px;line-height:1.75;color:#222222;">이 상태가 지속될 경우 Key Task 및 연계된 타 Task의 일정·품질에 직접적인 영향이 발생할 수 있는 높은 위험 단계입니다.</p>
-<div style="margin:0 0 20px 0;padding:14px 18px;background-color:#F6F6F6;border-left:3px solid #4A4A4A;">
-<p style="margin:0 0 6px 0;font-size:13px;line-height:1.6;color:#222222;"><span style="display:inline-block;min-width:120px;color:#767676;">관리항목</span>소방 대상 Item 확정 率</p>
-<p style="margin:0 0 6px 0;font-size:13px;line-height:1.6;color:#222222;"><span style="display:inline-block;min-width:120px;color:#767676;">관련 Key Task</span>P&amp;ID (IFD)</p>
-<p style="margin:0;font-size:13px;line-height:1.6;color:#222222;"><span style="display:inline-block;min-width:120px;color:#767676;">Key Task 담당자</span>프로젝트 LE</p>
-</div>
-<p style="margin:0 0 16px 0;font-size:14px;line-height:1.75;color:#222222;">즉시 완료 조치가 필요하며, 프로젝트 LE와 반드시 협의하여 진행해 주시기 바랍니다. 본 알람은 프로젝트 LE에게도 동시 발송됩니다.</p>
-<p style="margin:24px 0 0 0;padding-top:16px;border-top:1px solid #D8D8D8;font-size:12px;line-height:1.6;color:#767676;">본 메시지는 사전 설정된 관리 기준에 따라 시스템에서 자동 생성되었습니다.</p>
-</div></div></div>
-
-<!-- ============ 케이스 2: KeyTask Owner 단건 (D-1주 V2, 단일 공종) ============ -->
-<div style="margin:0;padding:24px 12px;background-color:#F0F0F0;font-family:'Malgun Gothic','맑은 고딕',Dotum,Arial,sans-serif;">
-<div style="max-width:760px;margin:0 auto;background-color:#FFFFFF;border:1px solid #D8D8D8;">
-<div style="padding:16px 32px;background-color:#3A3A3A;"><span style="font-size:15px;font-weight:bold;color:#FFFFFF;letter-spacing:0.5px;">[자동 안내 알람]</span></div>
-<div style="padding:28px 32px 32px 32px;">
-<p style="margin:0 0 16px 0;font-size:14px;line-height:1.75;color:#222222;">본 메일은 설계 진도 관리 시스템에 의해 자동 발송되었습니다.</p>
-<p style="margin:0 0 16px 0;font-size:14px;line-height:1.75;color:#222222;">완료 예정일을 1주일 앞둔 시점에서, Key Task "Key V/P"가 완료(100%)에는 도달하지 못한 것으로 확인되었습니다.</p>
-<p style="margin:0 0 16px 0;font-size:14px;line-height:1.75;color:#222222;">대부분 진행되었으나 아직 완료 상태가 아니므로, 마무리 전 누락 사항이 없는지 한 번 더 살펴보실 필요가 있습니다. 본 Key Task는 본인 소관 공종으로만 구성되어 있습니다.</p>
-<div style="margin:0 0 20px 0;padding:14px 18px;background-color:#F6F6F6;border-left:3px solid #4A4A4A;">
-<p style="margin:0 0 6px 0;font-size:13px;line-height:1.6;color:#222222;"><span style="display:inline-block;min-width:120px;color:#767676;">Key Task</span>Key V/P (기계)</p>
-<p style="margin:0;font-size:13px;line-height:1.6;color:#222222;"><span style="display:inline-block;min-width:120px;color:#767676;">담당</span>팀장 / LE</p>
-</div>
-<p style="margin:0 0 16px 0;font-size:14px;line-height:1.75;color:#222222;">완료 전 최종 점검을 직접 진행해 주시기 바랍니다.</p>
-<p style="margin:24px 0 0 0;padding-top:16px;border-top:1px solid #D8D8D8;font-size:12px;line-height:1.6;color:#767676;">본 메시지는 사전 설정된 관리 기준에 따라 시스템에서 자동 생성되었습니다.</p>
-</div></div></div>
-
-<!-- ============ 케이스 3: Digest (단일 프로젝트, 3건) ============ -->
-<div style="margin:0;padding:24px 12px;background-color:#F0F0F0;font-family:'Malgun Gothic','맑은 고딕',Dotum,Arial,sans-serif;">
-<div style="max-width:760px;margin:0 auto;background-color:#FFFFFF;border:1px solid #D8D8D8;">
-<div style="padding:16px 32px;background-color:#3A3A3A;"><span style="font-size:15px;font-weight:bold;color:#FFFFFF;letter-spacing:0.5px;">[자동 리스크 다이제스트]</span></div>
-<div style="padding:28px 32px 32px 32px;">
-<p style="margin:0 0 16px 0;font-size:14px;line-height:1.75;color:#222222;">본 메일은 설계 진도 관리 시스템에 의해 자동 발송되었습니다.</p>
-<div style="margin:0 0 20px 0;padding:16px 18px;background-color:#F6F6F6;border:1px solid #D8D8D8;">
-<p style="margin:0 0 10px 0;font-size:14px;line-height:1.6;color:#222222;">기계 공종 관련 리스크 항목이 금일 기준 총 <span style="font-weight:bold;">3건</span> 확인되었습니다.</p>
-<p style="margin:0;font-size:13px;line-height:1.6;color:#767676;">즉시조치 2건 &nbsp;/&nbsp; 만회조치 0건 &nbsp;/&nbsp; 조기점검 1건</p>
-</div>
-<p style="margin:0 0 16px 0;font-size:14px;line-height:1.75;color:#222222;">아래 목록을 확인하시어 우선순위(가장 시급한 항목 순)에 따라 조치해 주시기 바랍니다.</p>
-<table style="width:100%;border-collapse:collapse;margin:4px 0 20px 0;font-size:12px;color:#222222;">
-<tr>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">No</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">구분</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">명칭</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">관련 Key Task</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">단계</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">상태</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">필요 조치</th>
-</tr>
-<tr>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">1</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">관리항목</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">기계_Key Design Data 확정 率 (기계)</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">TBE - 기계</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">D-1주 (V1)</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">진행율 저조 - 품질·일정 리스크</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">즉시 완료 조치, 프로젝트 LE 협의 필수</td>
-</tr>
-<tr>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">2</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">관리항목</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">기계_Technical Clarification Close 率 (기계)</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">TBE - 기계</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">D-2주</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">진행율 저조 - 즉시 조치 필요</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">즉시 완료 조치, 프로젝트 LE 협의 필수</td>
-</tr>
-<tr>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">3</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">관리항목</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">PO 이슈 率 (기계)</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">PO 이슈率 - 기계</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">D-6주</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">진행율 저조 - 조기 점검 필요</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">조기 점검 및 완료 조치</td>
-</tr>
-</table>
-<p style="margin:0 0 16px 0;font-size:14px;line-height:1.75;color:#222222;">필요시 프로젝트 LE와 협의하여 진행해 주시기 바랍니다.</p>
-<p style="margin:24px 0 0 0;padding-top:16px;border-top:1px solid #D8D8D8;font-size:12px;line-height:1.6;color:#767676;">본 메시지는 사전 설정된 관리 기준에 따라 시스템에서 자동 생성되었습니다.</p>
-</div></div></div>
-
-<!-- ============ 케이스 4: MultiProject Digest (3개 프로젝트, 5건) ============ -->
-<div style="margin:0;padding:24px 12px;background-color:#F0F0F0;font-family:'Malgun Gothic','맑은 고딕',Dotum,Arial,sans-serif;">
-<div style="max-width:760px;margin:0 auto;background-color:#FFFFFF;border:1px solid #D8D8D8;">
-<div style="padding:16px 32px;background-color:#3A3A3A;"><span style="font-size:15px;font-weight:bold;color:#FFFFFF;letter-spacing:0.5px;">[자동 리스크 다이제스트]</span></div>
-<div style="padding:28px 32px 32px 32px;">
-<p style="margin:0 0 16px 0;font-size:14px;line-height:1.75;color:#222222;">본 메일은 설계 진도 관리 시스템에 의해 자동 발송되었습니다.</p>
-<div style="margin:0 0 20px 0;padding:16px 18px;background-color:#F6F6F6;border:1px solid #D8D8D8;">
-<p style="margin:0 0 10px 0;font-size:14px;line-height:1.6;color:#222222;">관리(관할)하고 계신 <span style="font-weight:bold;">3개</span> 프로젝트의 배관 공종에서 금일 기준 총 <span style="font-weight:bold;">5건</span>의 리스크 항목이 확인되었습니다.</p>
-<p style="margin:0;font-size:13px;line-height:1.6;color:#767676;">즉시조치 3건 &nbsp;/&nbsp; 만회조치 1건 &nbsp;/&nbsp; 조기점검 1건</p>
-</div>
-<p style="margin:0 0 16px 0;font-size:14px;line-height:1.75;color:#222222;">프로젝트별 세부 내역은 아래를 확인해 주시기 바랍니다.</p>
-
-<div style="margin:22px 0 8px 0;padding:8px 12px;background-color:#ECECEC;border-left:4px solid #4A4A4A;font-size:13px;font-weight:bold;color:#222222;">SAF (2건)</div>
-<table style="width:100%;border-collapse:collapse;margin:4px 0 20px 0;font-size:12px;color:#222222;">
-<tr>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">No</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">구분</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">명칭</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">관련 Key Task</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">단계</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">상태</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">필요 조치</th>
-</tr>
-<tr>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">1</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">관리항목</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">Piping Material Hold율 (배관)</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">1st U/G (40%) MTO - 배관</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">D-1주 (V1)</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">진행율 저조 - 품질·일정 리스크</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">즉시 완료 조치, 프로젝트 LE 협의 필수</td>
-</tr>
-<tr>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">2</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">Key Task</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">1st U/G (40%) MTO (배관)</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">-</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">D-2주</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">즉시 조치 필요</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">즉시 검토 및 조치, 관련 담당자 협의 필수</td>
-</tr>
-</table>
-
-<div style="margin:22px 0 8px 0;padding:8px 12px;background-color:#ECECEC;border-left:4px solid #4A4A4A;font-size:13px;font-weight:bold;color:#222222;">Zuluf (1건)</div>
-<table style="width:100%;border-collapse:collapse;margin:4px 0 20px 0;font-size:12px;color:#222222;">
-<tr>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">No</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">구분</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">명칭</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">관련 Key Task</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">단계</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">상태</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">필요 조치</th>
-</tr>
-<tr>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">1</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">관리항목</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">Stress 해석 수행 率 (배관)</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">A/G ISO Issue (70%) - 배관</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">D-2주</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">진행율 저조 - 즉시 조치 필요</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">즉시 완료 조치, 프로젝트 LE 협의 필수</td>
-</tr>
-</table>
-
-<div style="margin:22px 0 8px 0;padding:8px 12px;background-color:#ECECEC;border-left:4px solid #4A4A4A;font-size:13px;font-weight:bold;color:#222222;">TAZIZ (2건)</div>
-<table style="width:100%;border-collapse:collapse;margin:4px 0 20px 0;font-size:12px;color:#222222;">
-<tr>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">No</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">구분</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">명칭</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">관련 Key Task</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">단계</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">상태</th>
-<th style="padding:10px 8px;background-color:#4A4A4A;color:#FFFFFF;font-weight:normal;text-align:left;border:1px solid #4A4A4A;white-space:nowrap;">필요 조치</th>
-</tr>
-<tr>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">1</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">관리항목</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">Nozzle Orientation 확정 率 (배관)</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;">EP+F GA (IFD) - 기계</td>
-<td style="padding:9px 8px;border:1px solid #D8D8D8;vertical-align:top;line-height:1.5;text-align:center;white-space:nowrap;">D-4주</td
-
-
-
+<!-- 알림 발송 로그 마스터 INSERT (LOG_SEQ는 MAX+1 채번) -->
+	<insert id="insertEepPriNotiLog" parameterType="java.util.Map">
+	/* legacy-eep-mailing-mybatis.xml insertEepPriNotiLog */
+		<selectKey keyProperty="logSeq" resultType="java.lang.Long" order="BEFORE">
+			SELECT NVL(MAX(LOG_SEQ), 0) + 1
+			  FROM SEI_BK.BTA_EP_E_PRI_NOTI_LOG
+		</selectKey>
+		INSERT INTO SEI_BK.BTA_EP_E_PRI_NOTI_LOG (
+			LOG_SEQ
+			, BATCH_DT
+			, RCVR_EMPNO
+			, RCVR_NM
+			, RCVR_GBN
+			, RCVR_DEPT_NM
+			, RCVR_DISPLN_CD
+			, RCVR_DISPLN_NM
+			, MAIL_TYPE
+			, MAIL_LANG
+			, PJT_CNT
+			, ITEM_CNT
+			, IMMD_CNT
+			, RCVY_CNT
+			, ERLY_CNT
+			, MAIL_TITLE
+			, MAIL_BODY
+			, SEND_YN
+			, SEND_DT
+			, REG_DATE
+		) VALUES (
+			#{logSeq}
+			, #{batchDt}
+			, #{rcvrEmpno}
+			, #{rcvrNm}
+			, #{rcvrGbn}
+			, #{rcvrDeptNm}
+			, #{rcvrDisplnCd}
+			, #{rcvrDisplnNm}
+			, #{mailType}
+			, #{mailLang}
+			, #{pjtCnt}
+			, #{itemCnt}
+			, #{immdCnt}
+			, #{rcvyCnt}
+			, #{erlyCnt}
+			, #{mailTitle}
+			, #{mailBody}
+			, 'N'				<!-- 검증 단계에서는 미발송 -->
+			, NULL
+			, TO_CHAR(SYSDATE, 'YYYYMMDDHH24MISS')
+		)
+	</insert>
+
+
+
+
+<!-- 알림 발송 로그 상세 INSERT (메일 표에 들어간 항목) -->
+	<insert id="insertEepPriNotiLogDtl" parameterType="java.util.Map">
+	/* legacy-eep-mailing-mybatis.xml insertEepPriNotiLogDtl */
+		INSERT INTO SEI_BK.BTA_EP_E_PRI_NOTI_LOG_DTL (
+			LOG_SEQ
+			, ITEM_NO
+			, PJT_NO
+			, V_ORDER
+			, PRI_SEQ
+			, MNG_ITEM_NO
+			, PRI_MNG_ITEM_NM
+			, MST_DISPLN_CD
+			, MST_DISPLN_NM
+			, PRI_DTL_SEQ
+			, DTL_MNG_ITEM_NO
+			, PRI_MNG_ITEM_SUB_NM
+			, MAJ_DISPLN_CD
+			, DISPLN_NM
+			, OWNER_GBN
+			, PLAN_DT
+			, WEEKS_BEFORE
+			, VER
+			, DSN_COMP
+			, COMP_LIMIT
+			, ACTION_LVL
+			, STAGE_NM
+			, STATUS_NM
+			, ACTION_NM
+			, REG_DATE
+		) VALUES (
+			#{logSeq}
+			, #{itemNo}
+			, #{pjtNo}
+			, #{vOrder}
+			, #{priSeq}
+			, #{mngItemNo}
+			, #{priMngItemNm}
+			, #{mstDisplnCd}
+			, #{mstDisplnNm}
+			, #{priDtlSeq}
+			, #{dtlMngItemNo}
+			, #{priMngItemSubNm}
+			, #{majDisplnCd}
+			, #{displnNm}
+			, #{ownerGbn}
+			, #{planDt}
+			, #{weeksBefore}
+			, #{ver}
+			, #{dsnComp}
+			, #{compLimit}
+			, #{actionLvl}
+			, #{stageNm}
+			, #{statusNm}
+			, #{actionNm}
+			, TO_CHAR(SYSDATE, 'YYYYMMDDHH24MISS')
+		)
+	</insert>
 
