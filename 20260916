@@ -1,701 +1,969 @@
-package com.secl.pms.batch.legacy.writer;
-
-import java.io.UnsupportedEncodingException;
-import java.text.SimpleDateFormat;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-
-import org.springframework.batch.item.ItemWriter;
-
-import com.secl.common.batch.service.BatchMaillingService;
-import com.secl.pms.batch.support.PmsAbstractStep;
-import com.secl.pms.batch.template.eep.EepMailBody;
-import com.secl.pms.batch.template.eep.EepMailTable;
-import com.secl.pms.batch.template.eep.EepMailTemplate;
-import com.secl.pms.batch.vo.ProcessorResultVo;
-import com.secl.pms.batch.vo.TransactionVo;
-import com.secl.pms.batch.vo.eep.EepAlertItemVo;
-
-/**
- * EEP 설계진도 Risk Warning 알림 메일 Writer
- *
- * 처리 순서
- *   1. Processor 결과를 항목 VO 목록으로 변환 (마스터 미달 / 상세 미달 각각 1건씩)
- *   2. 수신자 조회용 파라미터(listParamMap) 구성
- *   3. 공종별 수신자(LE/그룹장/팀장) 조회
- *   4. 수신자 × 항목 매칭 → 수신자(사번) 단위로 묶음
- *   5. 수신자별로 메일 유형 판정 → 제목/본문 생성 → 로그 테이블 기록
- *
- * ※ 검증 단계이므로 실제 메일 발송(registerMail)은 주석 처리 상태.
- */
-@SuppressWarnings({ "rawtypes", "unchecked" })
-public class EepMailingWriter extends PmsAbstractStep implements ItemWriter<ProcessorResultVo> {
-
-    private final static String SQL = "EEP_MAILING.";
-
-    /** '설계본부'의 EPID (SELECT EPIP FROM SINGLE_USERINFO WHERE CN = '설계본부') */
-    private final static String SENDER_EP_ID = "M200309045649D801776";
-
-    /** 메일 제목/본문 컬럼 최대 바이트 */
-    private final static int TITLE_MAX_BYTES = 2000;
-    private final static int BODY_MAX_BYTES  = 4000;
-
-    protected BatchMaillingService batchMaillingService;
-
-    public void setBatchMaillingService(BatchMaillingService batchMaillingService) {
-        this.batchMaillingService = batchMaillingService;
-    }
-
-    @Override
-    public void write(List<? extends ProcessorResultVo> items) throws Exception {
-
-        TransactionVo insertVo = new TransactionVo(this);
-        String batchDt = new SimpleDateFormat("yyyyMMdd").format(new Date());
-
-        for (ProcessorResultVo item : items) {
-            int ifCnt = 0;  // 알림 대상 항목 수
-            int prCnt = 0;  // 생성된 메일 수
-
-            insertVo.setPjtNo(item.getPjtNo());
-            insertVo.setVersion(item.getVersion());
-
-            List targetList = item.getResultSet("eepPriDtlNotiTargetList");
-            if (targetList == null || targetList.isEmpty()) {
-                this.loggingPjtEnd(item.getPjtNo(), item.getVersion(), insertVo, ifCnt, prCnt);
-                continue;
-            }
-
-            /* ---------- 1. 항목 VO 목록 생성 ---------- */
-            List<EepAlertItemVo> alertList = createAlertList(targetList);
-            ifCnt = alertList.size();
-
-            /* ---------- 2. 수신자 조회 파라미터 구성 ---------- */
-            insertVo.setListParamMap(createListParamMap(targetList));
-
-            /* ---------- 3. 수신자 조회 ---------- */
-            List rcvrList = sqlTemplate.selectList(SQL + "selectEepPriDtlNotiRcvrList", insertVo);
-            if (rcvrList == null || rcvrList.isEmpty()) {
-                this.loggingPjtEnd(item.getPjtNo(), item.getVersion(), insertVo, ifCnt, prCnt);
-                continue;
-            }
-
-            /* ---------- 4. 수신자 × 항목 매칭 ---------- */
-            Map<String, Map<String, Object>>         rcvrInfoMap = new LinkedHashMap<String, Map<String, Object>>();
-            Map<String, Map<String, EepAlertItemVo>> rcvrItemMap = new LinkedHashMap<String, Map<String, EepAlertItemVo>>();
-
-            matchRcvrAndItem(rcvrList, alertList, rcvrInfoMap, rcvrItemMap);
-
-            /* ---------- 5. 수신자별 메일 생성 / 로그 기록 ---------- */
-            for (Map.Entry<String, Map<String, EepAlertItemVo>> entry : rcvrItemMap.entrySet()) {
-                String empno = entry.getKey();
-
-                List<EepAlertItemVo> myList = new ArrayList<EepAlertItemVo>(entry.getValue().values());
-                if (myList.isEmpty()) {
-                    continue;
-                }
-                Collections.sort(myList, EepAlertItemVo.SORT);
-
-                makeAndLogMail(batchDt, empno, rcvrInfoMap.get(empno), myList);
-                prCnt++;
-            }
-
-            /* 작업 결과 기록 */
-            this.loggingPjtEnd(item.getPjtNo(), item.getVersion(), insertVo, ifCnt, prCnt);
-        }
-    }
-
-    /* ============================================================
-     *  1. 항목 VO 목록 생성
-     *     한 행에서 마스터 미달 / 상세 미달이 동시에 발생할 수 있으므로
-     *     각각 별도의 VO로 생성한다.
-     * ============================================================ */
-    private List<EepAlertItemVo> createAlertList(List targetList) {
-        List<EepAlertItemVo> result = new ArrayList<EepAlertItemVo>();
-        Set<String> dupCheck = new LinkedHashSet<String>();
-
-        for (Object obj : targetList) {
-            Map<String, Object> row = (Map<String, Object>) obj;
-
-            // Key Task(마스터) 미달 건
-            if ("Y".equals(str(row.get("mstUnderYn")))) {
-                EepAlertItemVo vo = EepAlertItemVo.create(row, EepAlertItemVo.GBN_KEYTASK);
-                if (dupCheck.add(vo.getItemKey())) {
-                    result.add(vo);
-                }
-            }
-
-            // 상세관리항목 미달 건
-            if ("Y".equals(str(row.get("dtlUnderYn")))) {
-                EepAlertItemVo vo = EepAlertItemVo.create(row, EepAlertItemVo.GBN_ITEM);
-                if (dupCheck.add(vo.getItemKey())) {
-                    result.add(vo);
-                }
-            }
-        }
-        return result;
-    }
-
-    /* ============================================================
-     *  2. 수신자 조회 파라미터 (PJT_NO + PRI_SEQ + PRI_DTL_SEQ)
-     *     전 프로젝트 대상이므로 PJT_NO 필수
-     * ============================================================ */
-    private List<Map<String, Object>> createListParamMap(List targetList) {
-        List<Map<String, Object>> result = new ArrayList<Map<String, Object>>();
-        Set<String> dupCheck = new LinkedHashSet<String>();
-
-        for (Object obj : targetList) {
-            Map<String, Object> row = (Map<String, Object>) obj;
-
-            String pjtNo     = str(row.get("pjtNo"));
-            String priSeq     = str(row.get("priSeq"));
-            String priDtlSeq = str(row.get("priDtlSeq"));
-
-            String key = pjtNo + "_" + priSeq + "_" + priDtlSeq;
-            if (dupCheck.add(key)) {
-                Map<String, Object> param = new HashMap<String, Object>();
-                param.put("pjtNo", pjtNo);
-                param.put("priSeq", priSeq);
-                param.put("priDtlSeq", priDtlSeq);
-                result.add(param);
-            }
-        }
-        return result;
-    }
-
-    /* ============================================================
-     *  4. 수신자 × 항목 매칭
-     *     - 수신자 1행 = (프로젝트, 관리항목, 구분(KEYTASK/ITEM), 공종) 단위
-     *     - 해당 구분이 미달이고 공종이 일치하는 항목만 담는다
-     *     - 팀장은 D-1주 / D-2주만 수신 (기획서 r2)
-     * ============================================================ */
-    private void matchRcvrAndItem(List rcvrList,
-                                  List<EepAlertItemVo> alertList,
-                                  Map<String, Map<String, Object>> rcvrInfoMap,
-                                  Map<String, Map<String, EepAlertItemVo>> rcvrItemMap) {
-
-        /* 항목을 (프로젝트|마스터순번|상세순번|구분) 키로 색인 */
-        Map<String, List<EepAlertItemVo>> itemIndex = new HashMap<String, List<EepAlertItemVo>>();
-        for (EepAlertItemVo vo : alertList) {
-            String key = matchKey(vo.getPjtNo(), vo.getPriSeq(), vo.getPriDtlSeq(), vo.getOwnerGbn());
-            List<EepAlertItemVo> bucket = itemIndex.get(key);
-            if (bucket == null) {
-                bucket = new ArrayList<EepAlertItemVo>();
-                itemIndex.put(key, bucket);
-            }
-            bucket.add(vo);
-        }
-
-        for (Object obj : rcvrList) {
-            Map<String, Object> rcvr = (Map<String, Object>) obj;
-
-            String empno    = str(rcvr.get("empno"));
-            String recvGbn  = str(rcvr.get("recvGbn"));   // LE / GROUP_MANAGER / TEAM_MANAGER
-            String ownerGbn = str(rcvr.get("ownerGbn"));  // KEYTASK / ITEM
-            String discCd   = str(rcvr.get("discCd"));    // 수신자 공종코드
-
-            if (empno.length() == 0) {
-                continue;
-            }
-
-            String key = matchKey(str(rcvr.get("pjtNo")), str(rcvr.get("priSeq")),
-                                  str(rcvr.get("priDtlSeq")), ownerGbn);
-            List<EepAlertItemVo> bucket = itemIndex.get(key);
-            if (bucket == null) {
-                continue;
-            }
-
-            for (EepAlertItemVo vo : bucket) {
-                // 공종 일치 확인
-                if (!discCd.equals(vo.getViewDisplnCd())) {
-                    continue;
-                }
-                // 팀장은 D-1주 / D-2주만 발송
-                if ("TEAM_MANAGER".equals(recvGbn) && vo.getWeeksBefore() > 2) {
-                    continue;
-                }
-
-                // 수신자 기본정보는 첫 매칭 시점에 보관
-                if (!rcvrInfoMap.containsKey(empno)) {
-                    rcvrInfoMap.put(empno, rcvr);
-                    rcvrItemMap.put(empno, new LinkedHashMap<String, EepAlertItemVo>());
-                }
-                // itemKey 기준 중복 제거 (공종 복수 매핑 시 같은 항목이 여러 번 매칭됨)
-                rcvrItemMap.get(empno).put(vo.getItemKey(), vo);
-            }
-        }
-    }
-
-    private String matchKey(String pjtNo, String priSeq, String priDtlSeq, String ownerGbn) {
-        return pjtNo + "|" + priSeq + "|" + priDtlSeq + "|" + ownerGbn;
-    }
-
-    /* ============================================================
-     *  5. 수신자 1명분 메일 생성 + 로그 기록
-     * ============================================================ */
-    private void makeAndLogMail(String batchDt,
-                                String empno,
-                                Map<String, Object> rcvrInfo,
-                                List<EepAlertItemVo> myList) throws Exception {
-
-        /* ---------- 집계 ---------- */
-        int n = myList.size();
-        int immd = 0;   // 즉시조치
-        int rcvy = 0;   // 만회조치
-        int erly = 0;   // 조기점검
-
-        boolean hasD1 = false;
-        boolean hasD2 = false;
-        boolean hasD4 = false;
-
-        Set<String> pjtSet      = new LinkedHashSet<String>();  // 프로젝트 표기명
-        Set<String> displnNmSet = new LinkedHashSet<String>();  // 공종명
-        Set<String> displnCdSet = new LinkedHashSet<String>();  // 공종코드
-
-        for (EepAlertItemVo vo : myList) {
-            if (EepAlertItemVo.LVL_IMMD.equals(vo.getActionLvl())) {
-                immd++;
-            } else if (EepAlertItemVo.LVL_RCVY.equals(vo.getActionLvl())) {
-                rcvy++;
-            } else {
-                erly++;
-            }
-
-            int w = vo.getWeeksBefore();
-            if (w == 1) {
-                hasD1 = true;
-            } else if (w == 2) {
-                hasD2 = true;
-            } else if (w == 3 || w == 4) {
-                hasD4 = true;
-            }
-
-            pjtSet.add(vo.getVOrder());
-            displnNmSet.add(vo.getViewDisplnNm());
-            displnCdSet.add(vo.getViewDisplnCd());
-        }
-
-        int m = pjtSet.size();
-        String displnNm = join(displnNmSet, "/");
-        String displnCd = join(displnCdSet, ",");
-
-        /* ---------- 메일 유형 판정 ----------
-         *   1건            → 단건 (ITEM / KEYTASK)
-         *   2건 이상 + 1PJT → DIGEST
-         *   2건 이상 + 2PJT → MULTI
-         */
-        String mailType;
-        if (n == 1) {
-            mailType = myList.get(0).isKeyTask() ? "KEYTASK" : "ITEM";
-        } else if (m >= 2) {
-            mailType = "MULTI";
-        } else {
-            mailType = "DIGEST";
-        }
-
-        /* ---------- 제목 / 본문 생성 ---------- */
-        String title;
-        String body;
-
-        if ("ITEM".equals(mailType) || "KEYTASK".equals(mailType)) {
-            EepAlertItemVo vo = myList.get(0);
-            title = makeSingleTitle(vo);
-            body  = makeSingleBody(vo);
-        } else if ("DIGEST".equals(mailType)) {
-            title = makeDigestTitle(hasD1, hasD2, hasD4, false, first(pjtSet), m, n);
-            body  = makeDigestBody(myList, displnNm, n, immd, rcvy, erly);
-        } else {
-            title = makeDigestTitle(hasD1, hasD2, hasD4, true, first(pjtSet), m, n);
-            body  = makeMultiBody(myList, displnNm, m, n, immd, rcvy, erly);
-        }
-
-        /* ---------- 로그 마스터 INSERT ---------- */
-        Map<String, Object> logParam = new HashMap<String, Object>();
-        logParam.put("batchDt", batchDt);
-        logParam.put("rcvrEmpno", empno);
-        logParam.put("rcvrNm", str(rcvrInfo.get("hname")));
-        logParam.put("rcvrGbn", str(rcvrInfo.get("recvGbn")));
-        logParam.put("rcvrDeptNm", str(rcvrInfo.get("sdeptnm")));
-        logParam.put("rcvrDisplnCd", displnCd);
-        logParam.put("rcvrDisplnNm", displnNm);
-        logParam.put("mailType", mailType);
-        logParam.put("mailLang", str(rcvrInfo.get("mailLang")));
-        logParam.put("pjtCnt", Integer.valueOf(m));
-        logParam.put("itemCnt", Integer.valueOf(n));
-        logParam.put("immdCnt", Integer.valueOf(immd));
-        logParam.put("rcvyCnt", Integer.valueOf(rcvy));
-        logParam.put("erlyCnt", Integer.valueOf(erly));
-        logParam.put("mailTitle", cutByBytes(title, TITLE_MAX_BYTES));
-        logParam.put("mailBody", cutByBytes(body, BODY_MAX_BYTES));
-
-        sqlTemplate.update(SQL + "insertEepPriNotiLog", logParam);
-
-        Object logSeqObj = logParam.get("logSeq");
-        long logSeq = (logSeqObj instanceof Number) ? ((Number) logSeqObj).longValue() : 0L;
-
-        /* ---------- 로그 상세 INSERT ---------- */
-        int itemNo = 1;
-        for (EepAlertItemVo vo : myList) {
-            Map<String, Object> dtlParam = new HashMap<String, Object>();
-            dtlParam.put("logSeq", Long.valueOf(logSeq));
-            dtlParam.put("itemNo", Integer.valueOf(itemNo));
-            dtlParam.put("pjtNo", vo.getPjtNo());
-            dtlParam.put("vOrder", vo.getVOrder());
-            dtlParam.put("priSeq", vo.getPriSeq());
-            dtlParam.put("mngItemNo", vo.getMngItemNo());
-            dtlParam.put("priMngItemNm", vo.getPriMngItemNm());
-            dtlParam.put("mstDisplnCd", vo.getMstDisplnCd());
-            dtlParam.put("mstDisplnNm", vo.getMstDisplnNm());
-            dtlParam.put("priDtlSeq", vo.getPriDtlSeq());
-            dtlParam.put("priMngItemSubNm", vo.getPriMngItemSubNm());
-            dtlParam.put("majDisplnCd", vo.getMajDisplnCd());
-            dtlParam.put("displnNm", vo.getDisplnNm());
-            dtlParam.put("ownerGbn", vo.getOwnerGbn());
-            dtlParam.put("planDt", vo.getPlanDt());
-            dtlParam.put("weeksBefore", Integer.valueOf(vo.getWeeksBefore()));
-            dtlParam.put("ver", vo.getVer());
-            dtlParam.put("dsnComp", vo.getViewComp());
-            dtlParam.put("compLimit", Integer.valueOf(vo.getCompLimit()));
-            dtlParam.put("actionLvl", vo.getActionLvl());
-            dtlParam.put("stageNm", vo.getStageNm());
-            dtlParam.put("statusNm", vo.getStatusNm());
-            dtlParam.put("actionNm", vo.getActionNm());
-
-            sqlTemplate.update(SQL + "insertEepPriNotiLogDtl", dtlParam);
-            itemNo++;
-        }
-
-        /* ---------- 실제 메일 발송 (검증 완료 후 활성화) ---------- */
-        /*
-        Map<String, Object> mailParam = new HashMap<String, Object>();
-        mailParam.put("sender_ep_id", SENDER_EP_ID);
-        mailParam.put("title", title);
-        mailParam.put("contents", body);
-
-        List<String> rcvEmpList = new ArrayList<String>();
-        rcvEmpList.add(empno);
-        mailParam.put("rcvList", rcvEmpList);
-
-        // 개발자, PI 비밀참조
-        Map<String, Object> secretRcvMap = new HashMap<String, Object>();
-        secretRcvMap.put("20070724", "Y"); // 구서영
-        secretRcvMap.put("20110747", "Y"); // 유병철
-        secretRcvMap.put("T13621", "Y");   // 한승동
-        secretRcvMap.put("T08722", "Y");   // 김동진
-        mailParam.put("secretRcvMap", secretRcvMap);
-
-        batchMaillingService.registerMail(mailParam);
-        */
-    }
-
-    /* ============================================================
-     *  제목 생성
-     * ============================================================ */
-
-    /** 단건 제목 */
-    private String makeSingleTitle(EepAlertItemVo vo) {
-        String tmpl = EepMailTemplate.pickSingleSubject(vo.isKeyTask(), vo.getWeeksBefore(), vo.getVer());
-
-        Map<String, String> p = new HashMap<String, String>();
-        p.put("PJT", vo.getVOrder());
-        p.put("ITEM_NM", vo.getPriMngItemSubNm());
-        p.put("KEYTASK_NM", vo.getPriMngItemNm());
-
-        return EepMailTemplate.render(tmpl, p);
-    }
-
-    /** Digest / MultiProject 제목 */
-    private String makeDigestTitle(boolean hasD1, boolean hasD2, boolean hasD4,
-                                   boolean isMulti, String pjtNm, int m, int n) {
-        String tmpl = EepMailTemplate.pickDigestSubject(hasD1, hasD2, hasD4, isMulti);
-
-        Map<String, String> p = new HashMap<String, String>();
-        p.put("PJT", pjtNm);
-        p.put("M", String.valueOf(m));
-        p.put("N", String.valueOf(n));
-
-        return EepMailTemplate.render(tmpl, p);
-    }
-
-    /* ============================================================
-     *  본문 생성
-     * ============================================================ */
-
-    /** 단건 본문 */
-    private String makeSingleBody(EepAlertItemVo vo) {
-        String tmpl;
-
-        if (vo.isKeyTask()) {
-            /* KeyTask Owner
-             *   D-6/4/2 : 지연 관리항목이 본인 소관 공종인지
-             *   D-1     : Key Task가 단일 공종인지 (※ 현업 확인 대기 항목)
-             *   현재는 마스터 공종 == 상세 공종 여부로 판정
-             */
-            boolean ownScope = vo.getMstDisplnCd().equals(vo.getMajDisplnCd());
-            tmpl = EepMailBody.pickKeyTaskBody(vo.getWeeksBefore(), vo.getVer(), ownScope);
-        } else {
-            /* Item Owner : Key Task 공종 == 관리항목 공종 (LE=본인) */
-            boolean sameDispln = vo.getMstDisplnCd().equals(vo.getMajDisplnCd());
-            tmpl = EepMailBody.pickItemBody(vo.getWeeksBefore(), vo.getVer(), sameDispln);
-        }
-
-        Map<String, String> p = new HashMap<String, String>();
-        p.put("ITEM_NM", EepMailTemplate.esc(vo.getPriMngItemSubNm()));
-        p.put("KEYTASK_NM", EepMailTemplate.esc(vo.getPriMngItemNm()));
-        p.put("DELAY_ITEM_NM", EepMailTemplate.esc(vo.getPriMngItemSubNm()));
-        p.put("DELAY_SCOPE", vo.getMstDisplnCd().equals(vo.getMajDisplnCd()) ? "본인 소관" : "타 공종 소관");
-
-        String inner = EepMailTemplate.render(tmpl, p);
-        String head  = EepMailBody.pickHead(vo.getWeeksBefore(), vo.getVer());
-
-        return EepMailTemplate.wrap(head, inner);
-    }
-
-    /** Digest 본문 (단일 프로젝트) */
-    private String makeDigestBody(List<EepAlertItemVo> myList, String displnNm,
-                                  int n, int immd, int rcvy, int erly) {
-
-        Map<String, String> p = new HashMap<String, String>();
-        p.put("DISPLN_NM", EepMailTemplate.esc(displnNm));
-        p.put("N", String.valueOf(n));
-        p.put("X", String.valueOf(immd));
-        p.put("Y", String.valueOf(rcvy));
-        p.put("Z", String.valueOf(erly));
-        p.put("TABLE", EepMailTable.build(myList, false, 1));
-
-        String inner = EepMailTemplate.render(EepMailBody.KR_DIGEST, p);
-        return EepMailTemplate.wrap(EepMailTemplate.HEAD_DIGEST, inner);
-    }
-
-    /** MultiProject Digest 본문 (프로젝트별 섹션 반복) */
-    private String makeMultiBody(List<EepAlertItemVo> myList, String displnNm,
-                                 int m, int n, int immd, int rcvy, int erly) {
-
-        /* 프로젝트별로 묶기. myList는 이미 우선순위 순으로 정렬되어 있으므로
-         * LinkedHashMap을 쓰면 리스크가 높은 프로젝트가 자연스럽게 위로 온다. */
-        Map<String, List<EepAlertItemVo>> pjtMap = new LinkedHashMap<String, List<EepAlertItemVo>>();
-        for (EepAlertItemVo vo : myList) {
-            String pjtNm = vo.getVOrder();
-            List<EepAlertItemVo> bucket = pjtMap.get(pjtNm);
-            if (bucket == null) {
-                bucket = new ArrayList<EepAlertItemVo>();
-                pjtMap.put(pjtNm, bucket);
-            }
-            bucket.add(vo);
-        }
-
-        StringBuilder sections = new StringBuilder(8192);
-        for (Map.Entry<String, List<EepAlertItemVo>> e : pjtMap.entrySet()) {
-            List<EepAlertItemVo> sub = e.getValue();
-            sections.append(EepMailTable.section(e.getKey(), sub.size()));
-            sections.append(EepMailTable.build(sub, false, 1));
-        }
-
-        Map<String, String> p = new HashMap<String, String>();
-        p.put("DISPLN_NM", EepMailTemplate.esc(displnNm));
-        p.put("M", String.valueOf(m));
-        p.put("N", String.valueOf(n));
-        p.put("X", String.valueOf(immd));
-        p.put("Y", String.valueOf(rcvy));
-        p.put("Z", String.valueOf(erly));
-        p.put("SECTIONS", sections.toString());
-
-        String inner = EepMailTemplate.render(EepMailBody.KR_MULTI, p);
-        return EepMailTemplate.wrap(EepMailTemplate.HEAD_DIGEST, inner);
-    }
-
-    /* ============================================================
-     *  util
-     * ============================================================ */
-
-    private String str(Object o) {
-        return o == null ? "" : String.valueOf(o);
-    }
-
-    private String first(Set<String> set) {
-        for (String s : set) {
-            return s;
-        }
-        return "";
-    }
-
-    private String join(Set<String> set, String sep) {
-        StringBuilder sb = new StringBuilder();
-        for (String s : set) {
-            if (s == null || s.length() == 0) {
-                continue;
-            }
-            if (sb.length() > 0) {
-                sb.append(sep);
-            }
-            sb.append(s);
-        }
-        return sb.toString();
-    }
-
-    /** UTF-8 바이트 기준으로 자르고 넘치면 "..." 붙임 (한글 경계 안전) */
-    private String cutByBytes(String src, int maxBytes) {
-        if (src == null) {
-            return null;
-        }
-        byte[] bytes;
-        try {
-            bytes = src.getBytes("UTF-8");
-        } catch (UnsupportedEncodingException e) {
-            return src;
-        }
-        if (bytes.length <= maxBytes) {
-            return src;
-        }
-
-        int limit = maxBytes - 3; // "..." 자리 확보
-        // UTF-8 연속바이트(10xxxxxx) 위면 문자 시작 지점까지 뒤로
-        while (limit > 0 && (bytes[limit] & 0xC0) == 0x80) {
-            limit--;
-        }
-
-        try {
-            return new String(bytes, 0, limit, "UTF-8") + "...";
-        } catch (UnsupportedEncodingException e) {
-            return src;
-        }
-    }
+/* ============================================================================
+ * [1] XML — 기존 tpms-work-ep-eep-mailing.xml 에 추가
+ *     (namespace는 기존 파일 것 그대로 사용)
+ * ============================================================================ */
+
+	<!-- ========================================================
+	     관리항목 알람메일 발송로그 > 실행시각 목록
+	     ======================================================== -->
+	<select id="selectKeyTaskLogRunTimeList" parameterType="hashMap" resultType="snakeCaseMap">
+	/* tpms-work-ep-eep-mailing.xml selectKeyTaskLogRunTimeList */
+		SELECT
+			RUN_KEY
+			, SUBSTR(RUN_KEY, 1, 4) || '-' || SUBSTR(RUN_KEY, 5, 2) || '-' || SUBSTR(RUN_KEY, 7, 2)
+			  || ' ' || SUBSTR(RUN_KEY, 9, 2) || ':' || SUBSTR(RUN_KEY, 11, 2)
+			  || ' (' || MAIL_CNT || '건)' AS RUN_NM
+		FROM (
+			SELECT
+				SUBSTR(REG_DATE, 1, 12) AS RUN_KEY		/* YYYYMMDDHH24MI. 분 단위로 1회 실행 취급 */
+				, COUNT(*) AS MAIL_CNT
+			FROM
+				SEI_BK.BTA_EP_E_PRI_NOTI_LOG
+			WHERE 1 = 1
+			<if test="srch_from_dt != null and srch_from_dt != ''">
+				AND BATCH_DT <![CDATA[ >= ]]> REPLACE(#{srch_from_dt}, '.', '')
+			</if>
+			<if test="srch_to_dt != null and srch_to_dt != ''">
+				AND BATCH_DT <![CDATA[ <= ]]> REPLACE(#{srch_to_dt}, '.', '')
+			</if>
+			GROUP BY SUBSTR(REG_DATE, 1, 12)
+		)
+		ORDER BY RUN_KEY DESC
+	</select>
+
+	<!-- ========================================================
+	     관리항목 알람메일 발송로그 > Key Task 목록 (로그에 존재하는 것만)
+	     ======================================================== -->
+	<select id="selectKeyTaskLogTaskList" parameterType="hashMap" resultType="snakeCaseMap">
+	/* tpms-work-ep-eep-mailing.xml selectKeyTaskLogTaskList */
+		SELECT DISTINCT
+			DTL.PRI_SEQ
+			, DTL.PRI_MNG_ITEM_NM
+		FROM
+			SEI_BK.BTA_EP_E_PRI_NOTI_LOG_DTL DTL
+		WHERE
+			DTL.PRI_MNG_ITEM_NM IS NOT NULL
+		<if test="srch_pjt_no != null and srch_pjt_no != ''">
+			AND DTL.PJT_NO = #{srch_pjt_no}
+		</if>
+		ORDER BY DTL.PRI_MNG_ITEM_NM
+	</select>
+
+	<!-- ========================================================
+	     관리항목 알람메일 발송로그 > 하위 관리항목 목록 (로그에 존재하는 것만)
+	     ======================================================== -->
+	<select id="selectKeyTaskLogItemList" parameterType="hashMap" resultType="snakeCaseMap">
+	/* tpms-work-ep-eep-mailing.xml selectKeyTaskLogItemList */
+		SELECT DISTINCT
+			DTL.PRI_DTL_SEQ
+			, DTL.PRI_MNG_ITEM_SUB_NM
+		FROM
+			SEI_BK.BTA_EP_E_PRI_NOTI_LOG_DTL DTL
+		WHERE
+			DTL.OWNER_GBN = 'ITEM'					/* Key Task 건은 하위 관리항목이 아니므로 제외 */
+			AND DTL.PRI_MNG_ITEM_SUB_NM IS NOT NULL
+		<if test="srch_pjt_no != null and srch_pjt_no != ''">
+			AND DTL.PJT_NO = #{srch_pjt_no}
+		</if>
+		<if test="srch_pri_seq != null and srch_pri_seq != ''">
+			AND DTL.PRI_SEQ = #{srch_pri_seq}
+		</if>
+		ORDER BY DTL.PRI_MNG_ITEM_SUB_NM
+	</select>
+
+	<!-- ========================================================
+	     관리항목 알람메일 발송로그 > 목록 (메일 1통 = 1행)
+	     ======================================================== -->
+	<select id="selectKeyTaskLogList" parameterType="hashMap" resultType="snakeCaseMap">
+	/* tpms-work-ep-eep-mailing.xml selectKeyTaskLogList */
+		SELECT
+			L.LOG_SEQ
+			, L.BATCH_DT
+			, SUBSTR(L.BATCH_DT, 1, 4) || '-' || SUBSTR(L.BATCH_DT, 5, 2) || '-' || SUBSTR(L.BATCH_DT, 7, 2) AS BATCH_DT_NM
+			, SUBSTR(L.REG_DATE, 9, 2) || ':' || SUBSTR(L.REG_DATE, 11, 2) AS RUN_TM
+			, L.RCVR_EMPNO
+			, L.RCVR_NM
+			, L.RCVR_GBN
+			, CASE L.RCVR_GBN
+				WHEN 'LE' THEN 'LE'
+				WHEN 'GROUP_MANAGER' THEN '그룹장'
+				WHEN 'TEAM_MANAGER' THEN '팀장'
+				ELSE L.RCVR_GBN
+			  END AS RCVR_GBN_NM
+			, L.RCVR_DEPT_NM
+			, L.RCVR_DISPLN_NM
+			, L.MAIL_TYPE
+			, CASE L.MAIL_TYPE
+				WHEN 'ITEM' THEN '관리항목(단건)'
+				WHEN 'KEYTASK' THEN 'Key Task(단건)'
+				WHEN 'DIGEST' THEN 'Digest'
+				WHEN 'MULTI' THEN 'Multi PJT'
+				ELSE L.MAIL_TYPE
+			  END AS MAIL_TYPE_NM
+			, L.MAIL_LANG
+			, L.PJT_CNT
+			, L.ITEM_CNT
+			, L.IMMD_CNT
+			, L.RCVY_CNT
+			, L.ERLY_CNT
+			, L.IMMD_CNT || ' / ' || L.RCVY_CNT || ' / ' || L.ERLY_CNT AS ACTION_CNT_NM
+			, L.MAIL_TITLE
+			, L.SEND_YN
+
+			/* 해당 메일에 포함된 프로젝트 목록 */
+			, (
+				SELECT LISTAGG(X.V_ORDER, ', ') WITHIN GROUP (ORDER BY X.V_ORDER)
+				FROM (
+					SELECT DISTINCT D2.V_ORDER
+					FROM SEI_BK.BTA_EP_E_PRI_NOTI_LOG_DTL D2
+					WHERE D2.LOG_SEQ = L.LOG_SEQ
+				) X
+			  ) AS PJT_NMS
+		FROM
+			SEI_BK.BTA_EP_E_PRI_NOTI_LOG L
+		WHERE 1 = 1
+		<if test="srch_from_dt != null and srch_from_dt != ''">
+			AND L.BATCH_DT <![CDATA[ >= ]]> REPLACE(#{srch_from_dt}, '.', '')
+		</if>
+		<if test="srch_to_dt != null and srch_to_dt != ''">
+			AND L.BATCH_DT <![CDATA[ <= ]]> REPLACE(#{srch_to_dt}, '.', '')
+		</if>
+		<if test="srch_run_key != null and srch_run_key != ''">
+			AND SUBSTR(L.REG_DATE, 1, 12) = #{srch_run_key}		/* 특정 실행 회차 */
+		</if>
+		<if test="srch_mail_type != null and srch_mail_type != ''">
+			AND L.MAIL_TYPE = #{srch_mail_type}
+		</if>
+		<if test="srch_rcvr_gbn != null and srch_rcvr_gbn != ''">
+			AND L.RCVR_GBN = #{srch_rcvr_gbn}
+		</if>
+		<if test="srch_send_yn != null and srch_send_yn != ''">
+			AND NVL(L.SEND_YN, 'N') = #{srch_send_yn}
+		</if>
+		<if test="srch_rcvr != null and srch_rcvr != ''">
+			AND (L.RCVR_EMPNO LIKE '%' || #{srch_rcvr} || '%'
+			  OR L.RCVR_NM LIKE '%' || #{srch_rcvr} || '%')
+		</if>
+
+		<!--
+			프로젝트 / 공종 / Key Task / 관리항목은 마스터에 없고 상세에만 존재함.
+			따라서 EXISTS 로 "해당 조건에 맞는 항목이 1건이라도 포함된 메일"을 필터링한다.
+			(Digest 메일이면 조건에 맞지 않는 다른 항목도 함께 포함되어 있을 수 있음)
+		-->
+		<if test="(srch_pjt_no != null and srch_pjt_no != '')
+			   or (srch_displn_cd != null and srch_displn_cd != '' and srch_displn_cd != 'ALL')
+			   or (srch_pri_seq != null and srch_pri_seq != '')
+			   or (srch_pri_dtl_seq != null and srch_pri_dtl_seq != '')">
+			AND EXISTS (
+				SELECT 1
+				FROM SEI_BK.BTA_EP_E_PRI_NOTI_LOG_DTL DTL
+				WHERE DTL.LOG_SEQ = L.LOG_SEQ
+				<if test="srch_pjt_no != null and srch_pjt_no != ''">
+					AND DTL.PJT_NO = #{srch_pjt_no}
+				</if>
+				<if test="srch_pri_seq != null and srch_pri_seq != ''">
+					AND DTL.PRI_SEQ = #{srch_pri_seq}
+				</if>
+				<if test="srch_pri_dtl_seq != null and srch_pri_dtl_seq != ''">
+					AND DTL.PRI_DTL_SEQ = #{srch_pri_dtl_seq}
+					AND DTL.OWNER_GBN = 'ITEM'		/* 하위 관리항목 조건이므로 Key Task 건은 제외 */
+				</if>
+				<if test="srch_displn_cd != null and srch_displn_cd != '' and srch_displn_cd != 'ALL'">
+					<!--
+						수신자 공종(RCVR_DISPLN_CD)은 복수 담당 시 'J1,J2' 형태로 저장되어
+						정확한 매칭이 어려우므로, 상세의 공종코드로 비교한다.
+						구분(OWNER_GBN)에 따라 참조할 공종 컬럼이 다름.
+					-->
+					AND (
+						(DTL.OWNER_GBN = 'KEYTASK' AND DTL.MST_DISPLN_CD = #{srch_displn_cd})
+						OR
+						(DTL.OWNER_GBN = 'ITEM' AND DTL.MAJ_DISPLN_CD = #{srch_displn_cd})
+					)
+				</if>
+			)
+		</if>
+		ORDER BY
+			L.BATCH_DT DESC
+			, L.REG_DATE DESC
+			, L.MAIL_TYPE
+			, L.RCVR_NM
+	</select>
+
+	<!-- ========================================================
+	     관리항목 알람메일 발송로그 > 상세 항목 (메일 본문 표에 들어간 항목)
+	     ======================================================== -->
+	<select id="selectKeyTaskLogDtlList" parameterType="hashMap" resultType="snakeCaseMap">
+	/* tpms-work-ep-eep-mailing.xml selectKeyTaskLogDtlList */
+		SELECT
+			DTL.LOG_SEQ
+			, DTL.ITEM_NO
+			, DTL.PJT_NO
+			, DTL.V_ORDER
+			, DTL.PRI_SEQ
+			, DTL.PRI_MNG_ITEM_NM
+			, DTL.MST_DISPLN_CD
+			, DTL.MST_DISPLN_NM
+			, DTL.PRI_DTL_SEQ
+			, DTL.PRI_MNG_ITEM_SUB_NM
+			, DTL.MAJ_DISPLN_CD
+			, DTL.DISPLN_NM
+			, DTL.OWNER_GBN
+			, CASE DTL.OWNER_GBN WHEN 'KEYTASK' THEN 'Key Task' ELSE '관리항목' END AS OWNER_GBN_NM
+
+			/* 표 '명칭' / '관련 Key Task' 컬럼은 구분에 따라 표시값이 달라짐 */
+			, CASE WHEN DTL.OWNER_GBN = 'KEYTASK' THEN DTL.PRI_MNG_ITEM_NM
+				   ELSE DTL.PRI_MNG_ITEM_SUB_NM END AS VIEW_NM
+			, CASE WHEN DTL.OWNER_GBN = 'KEYTASK' THEN '-'
+				   ELSE DTL.PRI_MNG_ITEM_NM END AS VIEW_KEYTASK_NM
+			, CASE WHEN DTL.OWNER_GBN = 'KEYTASK' THEN DTL.MST_DISPLN_NM
+				   ELSE DTL.DISPLN_NM END AS VIEW_DISPLN_NM
+
+			, DTL.PLAN_DT
+			, SUBSTR(DTL.PLAN_DT, 1, 4) || '-' || SUBSTR(DTL.PLAN_DT, 5, 2) || '-' || SUBSTR(DTL.PLAN_DT, 7, 2) AS PLAN_DT_NM
+			, DTL.WEEKS_BEFORE
+			, DTL.VER
+			, DTL.DSN_COMP
+			, DTL.COMP_LIMIT
+			, DTL.ACTION_LVL
+			, DTL.STAGE_NM
+			, DTL.STATUS_NM
+			, DTL.ACTION_NM
+		FROM
+			SEI_BK.BTA_EP_E_PRI_NOTI_LOG_DTL DTL
+		WHERE
+			DTL.LOG_SEQ = #{log_seq}
+		ORDER BY
+			DTL.ITEM_NO
+	</select>
+
+	<!-- ========================================================
+	     관리항목 알람메일 발송로그 > 메일 본문 조회 (미리보기용)
+	     ======================================================== -->
+	<select id="selectKeyTaskLogBody" parameterType="hashMap" resultType="snakeCaseMap">
+	/* tpms-work-ep-eep-mailing.xml selectKeyTaskLogBody */
+		SELECT
+			L.LOG_SEQ
+			, L.MAIL_TITLE
+			, L.MAIL_BODY
+			, L.RCVR_NM
+			, L.RCVR_EMPNO
+			, L.RCVR_DEPT_NM
+			, L.RCVR_DISPLN_NM
+			, L.ITEM_CNT
+			, L.IMMD_CNT
+			, L.RCVY_CNT
+			, L.ERLY_CNT
+			, CASE L.MAIL_TYPE
+				WHEN 'ITEM' THEN '관리항목(단건)'
+				WHEN 'KEYTASK' THEN 'Key Task(단건)'
+				WHEN 'DIGEST' THEN 'Digest'
+				WHEN 'MULTI' THEN 'Multi PJT'
+				ELSE L.MAIL_TYPE
+			  END AS MAIL_TYPE_NM
+		FROM
+			SEI_BK.BTA_EP_E_PRI_NOTI_LOG L
+		WHERE
+			L.LOG_SEQ = #{log_seq}
+	</select>
+
+
+/* ============================================================================
+ * [2] Service Interface — TpmsWorkEepMailingService.java 에 메소드 추가
+ * ============================================================================ */
+
+	/* 관리항목 알람메일 발송로그 > 실행시각 목록 */
+	public List<Map<String, Object>> selectKeyTaskLogRunTimeList(Map<String, Object> params) throws Exception;
+
+	/* 관리항목 알람메일 발송로그 > Key Task 목록 */
+	public List<Map<String, Object>> selectKeyTaskLogTaskList(Map<String, Object> params) throws Exception;
+
+	/* 관리항목 알람메일 발송로그 > 하위 관리항목 목록 */
+	public List<Map<String, Object>> selectKeyTaskLogItemList(Map<String, Object> params) throws Exception;
+
+	/* 관리항목 알람메일 발송로그 > 목록 */
+	public List<Map<String, Object>> selectKeyTaskLogList(Map<String, Object> params) throws Exception;
+
+	/* 관리항목 알람메일 발송로그 > 상세 항목 */
+	public List<Map<String, Object>> selectKeyTaskLogDtlList(Map<String, Object> params) throws Exception;
+
+	/* 관리항목 알람메일 발송로그 > 메일 본문 */
+	public Map<String, Object> selectKeyTaskLogBody(Map<String, Object> params) throws Exception;
+
+
+/* ============================================================================
+ * [3] Service Impl — TpmsWorkEepMailingServiceImpl.java 에 메소드 추가
+ * ============================================================================ */
+
+	@Override
+	public List<Map<String, Object>> selectKeyTaskLogRunTimeList(Map<String, Object> params) throws Exception {
+		return (List<Map<String, Object>>) commonDao.selectList(SQLSTATEMENT+"selectKeyTaskLogRunTimeList", params);
+	}
+
+	@Override
+	public List<Map<String, Object>> selectKeyTaskLogTaskList(Map<String, Object> params) throws Exception {
+		return (List<Map<String, Object>>) commonDao.selectList(SQLSTATEMENT+"selectKeyTaskLogTaskList", params);
+	}
+
+	@Override
+	public List<Map<String, Object>> selectKeyTaskLogItemList(Map<String, Object> params) throws Exception {
+		return (List<Map<String, Object>>) commonDao.selectList(SQLSTATEMENT+"selectKeyTaskLogItemList", params);
+	}
+
+	@Override
+	public List<Map<String, Object>> selectKeyTaskLogList(Map<String, Object> params) throws Exception {
+		return (List<Map<String, Object>>) commonDao.selectList(SQLSTATEMENT+"selectKeyTaskLogList", params);
+	}
+
+	@Override
+	public List<Map<String, Object>> selectKeyTaskLogDtlList(Map<String, Object> params) throws Exception {
+		return (List<Map<String, Object>>) commonDao.selectList(SQLSTATEMENT+"selectKeyTaskLogDtlList", params);
+	}
+
+	@Override
+	public Map<String, Object> selectKeyTaskLogBody(Map<String, Object> params) throws Exception {
+		return (Map<String, Object>) commonDao.selectOne(SQLSTATEMENT+"selectKeyTaskLogBody", params);
+	}
+
+
+/* ============================================================================
+ * [4] Controller — TpmsWorkEepMailingController.java
+ *     기존 keyTaskLogMng 메소드를 아래 내용으로 교체 + 나머지 메소드 추가
+ * ============================================================================ */
+
+	/**
+	 * 관리항목 알람메일 발송로그 화면
+	 * @param params
+	 * @param request
+	 * @return
+	 * @throws Exception
+	 */
+	@RequestMapping(value="/keyTaskMailing/keyTaskLogMng")
+	public ModelAndView keyTaskLogMng(@RequestBody TpmsMap params, HttpServletRequest request, HttpServletResponse response) throws Exception {
+		ModelAndView mav = new ModelAndView();
+		mav.setViewName(uiResourceRoot+request.getServletPath());
+
+		/* 프로젝트 목록 */
+		mav.addObject("pjtList", tpmsWorkEepPrjMgrService.selectTpmsWorkEepUsePrjList(params));
+
+		/* 공종 목록 (맨 앞에 '전공종' 추가) */
+		List<Map<String, Object>> displnList = eepCommonService.selectDisplineList(params);
+		List<Map<String, Object>> displnDtlList = new ArrayList<Map<String, Object>>();
+		Map<String, Object> allItem = new HashMap<String, Object>();
+		allItem.put("displn_cd", "ALL");
+		allItem.put("displn_nm", "전공종");
+		displnDtlList.add(allItem);
+		displnDtlList.addAll(displnList);
+		mav.addObject("disciplineDtlList", displnDtlList);
+
+		/* 검색 기본일자 : 오늘 ~ 오늘 */
+		String today = DateUtils.getDay("", 0, "yyyyMMdd");
+		mav.addObject("yyyymmdd_from", today);
+		mav.addObject("yyyymmdd_to", today);
+
+		mav.addAllObjects(params);
+		return mav;
+	}
+
+	/**
+	 * 관리항목 알람메일 발송로그 > 실행시각 목록 조회
+	 */
+	@RequestMapping(value = "/keyTaskMailing/selectKeyTaskLogRunTimeList", method = RequestMethod.POST)
+	public @ResponseBody Map<String, Object> selectKeyTaskLogRunTimeList(@RequestBody Map<String, Object> params) throws Exception {
+		Map<String, Object> result = new HashMap<String, Object>();
+		result.put("list", tpmsWorkEepMailingService.selectKeyTaskLogRunTimeList(params));
+		return result;
+	}
+
+	/**
+	 * 관리항목 알람메일 발송로그 > Key Task 목록 조회
+	 */
+	@RequestMapping(value = "/keyTaskMailing/selectKeyTaskLogTaskList", method = RequestMethod.POST)
+	public @ResponseBody Map<String, Object> selectKeyTaskLogTaskList(@RequestBody Map<String, Object> params) throws Exception {
+		Map<String, Object> result = new HashMap<String, Object>();
+		result.put("list", tpmsWorkEepMailingService.selectKeyTaskLogTaskList(params));
+		return result;
+	}
+
+	/**
+	 * 관리항목 알람메일 발송로그 > 하위 관리항목 목록 조회
+	 */
+	@RequestMapping(value = "/keyTaskMailing/selectKeyTaskLogItemList", method = RequestMethod.POST)
+	public @ResponseBody Map<String, Object> selectKeyTaskLogItemList(@RequestBody Map<String, Object> params) throws Exception {
+		Map<String, Object> result = new HashMap<String, Object>();
+		result.put("list", tpmsWorkEepMailingService.selectKeyTaskLogItemList(params));
+		return result;
+	}
+
+	/**
+	 * 관리항목 알람메일 발송로그 > 목록 조회
+	 */
+	@RequestMapping(value = "/keyTaskMailing/selectKeyTaskLogList", method = RequestMethod.POST)
+	public @ResponseBody Map<String, Object> selectKeyTaskLogList(@RequestBody Map<String, Object> params) throws Exception {
+		Map<String, Object> result = new HashMap<String, Object>();
+		result.put("list", tpmsWorkEepMailingService.selectKeyTaskLogList(params));
+		return result;
+	}
+
+	/**
+	 * 관리항목 알람메일 발송로그 > 상세 항목 + 메일본문 조회
+	 */
+	@RequestMapping(value = "/keyTaskMailing/selectKeyTaskLogDtlList", method = RequestMethod.POST)
+	public @ResponseBody Map<String, Object> selectKeyTaskLogDtlList(@RequestBody Map<String, Object> params) throws Exception {
+		Map<String, Object> result = new HashMap<String, Object>();
+		result.put("info", tpmsWorkEepMailingService.selectKeyTaskLogBody(params));
+		result.put("list", tpmsWorkEepMailingService.selectKeyTaskLogDtlList(params));
+		return result;
+	}
+
+
+/* ============================================================================
+ * [5] JSP — /pages/app/tpmswork/ep/eep/keyTaskMailing/keyTaskLogMng.jsp
+ * ============================================================================ */
+
+<%@ page language="java" contentType="text/html; charset=UTF-8" pageEncoding="UTF-8"%>
+<%@ include file="/WEB-INF/pages/app/taglib.jsp" %>
+<%--
+	화면명 : TPMS입력시스템 > EP 시스템 > 설계 EP > 관리항목 알람메일 발송로그
+	작성일 : 2026. 09. 16
+	설계진도 Risk Warning 알림메일 발송 로그를 조회하는 화면
+--%>
+
+<style>
+	#listTable td {
+		text-overflow: ellipsis; overflow: hidden; white-space: nowrap;
+	}
+	/* 모달 내 상세 항목 표 */
+	#dtlTable {
+		width: 100%; border-collapse: collapse; font-size: 11px;
+	}
+	#dtlTable th {
+		padding: 6px 4px; background-color: #4A4A4A; color: #FFF;
+		border: 1px solid #4A4A4A; white-space: nowrap; font-weight: normal;
+	}
+	#dtlTable td {
+		padding: 6px 4px; border: 1px solid #D8D8D8; vertical-align: top;
+	}
+	.dtl-c { text-align: center; white-space: nowrap; }
+	/* 메일 본문 미리보기 iframe */
+	#mailPreview {
+		width: 100%; height: 520px; border: 1px solid #D8D8D8; background: #FFF;
+	}
+	.log-info-box {
+		padding: 10px 14px; background-color: #F6F6F6;
+		border: 1px solid #E0E0E0; margin-bottom: 10px; font-size: 12px;
+	}
+	.log-info-box span.lbl {
+		display: inline-block; min-width: 70px; color: #767676;
+	}
+	.badge-send-y { color: #1F6FB2; font-weight: bold; }
+	.badge-send-n { color: #999999; }
+</style>
+
+<div class="row col m-0 p-0">
+	<div class="col m-0 p-0">
+		<div class="d-block w30 bg_col_main h3px mb-2"></div>
+		<span class="font-weight-bold font_12pt" id="title">관리항목 알람메일 발송로그</span>
+	</div>
+</div>
+
+<!-- 상세 모달 -->
+<div id="logDtlModal" class="modal fade" tabindex="-1" role="dialog" aria-hidden="true">
+	<div class="modal-dialog modal-xl modal-dialog-scrollable modal-dialog-centered" role="document">
+		<div class="modal-content" style="min-width:900px; height:auto;">
+			<div class="modal-header py-2">
+				<span class="font-weight-bold font_11pt">알람메일 상세</span>
+				<button type="button" class="close" data-dismiss="modal" aria-label="Close">
+					<span aria-hidden="true">&times;</span>
+				</button>
+			</div>
+			<div class="modal-body">
+				<div class="log-info-box" id="dtlInfoBox"></div>
+
+				<ul class="nav nav-tabs" id="dtlTab">
+					<li class="nav-item">
+						<a class="nav-link active" data-toggle="tab" href="#tabItem">대상 항목</a>
+					</li>
+					<li class="nav-item">
+						<a class="nav-link" data-toggle="tab" href="#tabBody">메일 본문</a>
+					</li>
+				</ul>
+				<div class="tab-content pt-3">
+					<div class="tab-pane fade show active" id="tabItem">
+						<table id="dtlTable">
+							<thead>
+								<tr>
+									<th>No</th>
+									<th>프로젝트</th>
+									<th>구분</th>
+									<th>명칭</th>
+									<th>관련 Key Task</th>
+									<th>공종</th>
+									<th>Plan일자</th>
+									<th>단계</th>
+									<th>완성도</th>
+									<th>임계값</th>
+									<th>상태</th>
+									<th>필요 조치</th>
+								</tr>
+							</thead>
+							<tbody id="dtlTableBody"></tbody>
+						</table>
+					</div>
+					<div class="tab-pane fade" id="tabBody">
+						<iframe id="mailPreview" frameborder="0"></iframe>
+					</div>
+				</div>
+			</div>
+		</div>
+	</div>
+</div>
+
+<!-- 검색조건 -->
+<div class="current_info" style="gap: 0px;">
+	<div class="d-inline-block py3 mr10">
+		<label class="font_10pt mr15">
+			<i class="fas fa-caret-right"></i> 프로젝트 :
+		</label>
+		<select id="srchPjtNo" class="selectpicker_custom selectpicker" data-width="200px">
+			<option value="">전체</option>
+			<c:forEach var="item" items="${pjtList}">
+				<option value='${item.pjt_no}'>[<c:out value="${item.pjt_no}"/>] ${item.pjt_short_name}</option>
+			</c:forEach>
+		</select>
+	</div>
+	<div class="d-inline-block py3 mr10">
+		<label class="font_10pt mr15">
+			<i class="fas fa-caret-right"></i> 공종 :
+		</label>
+		<select id="srchDisplnCd" class="selectpicker_custom selectpicker" data-width="120px">
+			<c:forEach var="item" items="${disciplineDtlList}">
+				<option value='${item.displn_cd}'>${item.displn_nm}</option>
+			</c:forEach>
+		</select>
+	</div>
+	<div class="d-inline-block py3 mr10">
+		<label class="font_10pt">
+			<i class="fas fa-caret-right mr5"></i>배치일자
+		</label>
+		<fmt:parseDate value="${yyyymmdd_from}" var="cutOffFromDt" pattern="yyyyMMdd"/>
+		<input name="yyyymmdd_from" class="form-control form-control-sm d-inline-block w100 vertical-align-middle" id="yyyymmdd_from" type="text"
+			value="<fmt:formatDate value="${cutOffFromDt}" pattern="yyyy.MM.dd"/>">
+		~
+		<fmt:parseDate value="${yyyymmdd_to}" var="cutOffToDt" pattern="yyyyMMdd"/>
+		<input name="yyyymmdd_to" class="form-control form-control-sm d-inline-block w100 vertical-align-middle" id="yyyymmdd_to" type="text"
+			value="<fmt:formatDate value="${cutOffToDt}" pattern="yyyy.MM.dd"/>">
+	</div>
+	<div class="d-inline-block py3 mr10">
+		<label class="font_10pt mr15">
+			<i class="fas fa-caret-right"></i> 실행시각 :
+		</label>
+		<select id="srchRunKey" class="selectpicker_custom selectpicker" data-width="190px">
+			<option value="">전체</option>
+		</select>
+	</div>
+</div>
+
+<div class="current_info" style="gap: 0px;">
+	<div class="d-inline-block py3 mr10">
+		<label class="font_10pt mr15">
+			<i class="fas fa-caret-right"></i> Key Task :
+		</label>
+		<select id="srchPriSeq" class="selectpicker_custom selectpicker" data-width="200px">
+			<option value="">전체</option>
+		</select>
+	</div>
+	<div class="d-inline-block py3 mr10">
+		<label class="font_10pt mr15">
+			<i class="fas fa-caret-right"></i> 관리항목 :
+		</label>
+		<select id="srchPriDtlSeq" class="selectpicker_custom selectpicker" data-width="200px">
+			<option value="">전체</option>
+		</select>
+	</div>
+	<div class="d-inline-block py3 mr10">
+		<label class="font_10pt mr15">
+			<i class="fas fa-caret-right"></i> 메일유형 :
+		</label>
+		<select id="srchMailType" class="selectpicker_custom selectpicker" data-width="130px">
+			<option value="" selected>전체</option>
+			<option value="ITEM">관리항목(단건)</option>
+			<option value="KEYTASK">Key Task(단건)</option>
+			<option value="DIGEST">Digest</option>
+			<option value="MULTI">Multi PJT</option>
+		</select>
+	</div>
+	<div class="d-inline-block py3 mr10">
+		<label class="font_10pt mr15">
+			<i class="fas fa-caret-right"></i> 수신자구분 :
+		</label>
+		<select id="srchRcvrGbn" class="selectpicker_custom selectpicker" data-width="100px">
+			<option value="" selected>전체</option>
+			<option value="LE">LE</option>
+			<option value="GROUP_MANAGER">그룹장</option>
+			<option value="TEAM_MANAGER">팀장</option>
+		</select>
+	</div>
+	<div class="d-inline-block py3 mr10">
+		<label class="font_10pt mr15">
+			<i class="fas fa-caret-right"></i> 발송여부 :
+		</label>
+		<select id="srchSendYn" class="selectpicker_custom selectpicker" data-width="80px">
+			<option value="" selected>전체</option>
+			<option value="Y">Y</option>
+			<option value="N">N</option>
+		</select>
+	</div>
+	<div class="d-inline-block py3 mr10">
+		<label class="font_10pt mr15">
+			<i class="fas fa-caret-right"></i> 수신자 :
+		</label>
+		<input name="srchRcvr" class="form-control form-control-sm d-inline-block w140 vertical-align-middle" id="srchRcvr" type="text"
+			placeholder="사번 / 성명" onkeydown="if(event.keyCode==13){searchList();}">
+	</div>
+	<div class="d-inline-block py3">
+		<button type="button" class="btn btn-sm btn-dark" id="btnSearch" onclick="searchList();">
+			<i class="fas fa-search"></i> 검색
+		</button>
+		<button class="btn btn-sm btn-dark pageMenuButton mr5" data-action="excelDown">
+			<i class="fas fa-file-excel mr5"></i> 엑셀
+		</button>
+	</div>
+</div>
+
+<div class="row col m-0 p-0">
+	<div class="w100p p-0 position-relative">
+		<div class="w100p">
+			<table id="listTable" class="dark_type font_11pt w100p" style="table-layout:fixed;" border="0" cellpadding="0" cellspacing="0">
+				<colgroup>
+					<col width="8%">
+					<col width="5%">
+					<col width="9%">
+					<col width="6%">
+					<col width="9%">
+					<col width="7%">
+					<col width="9%">
+					<col width="5%">
+					<col width="4%">
+					<col width="7%">
+					<col width="26%">
+					<col width="5%">
+				</colgroup>
+				<thead>
+					<tr>
+						<th>배치일자</th>
+						<th>실행<br/>시각</th>
+						<th>수신자</th>
+						<th>구분</th>
+						<th>부서</th>
+						<th>공종</th>
+						<th>메일유형</th>
+						<th>프로젝트</th>
+						<th>항목<br/>수</th>
+						<th>즉시/만회<br/>/조기</th>
+						<th>제목</th>
+						<th>발송</th>
+					</tr>
+				</thead>
+			</table>
+		</div>
+		<span class="lineH1px"></span>
+	</div>
+</div>
+
+<script type="text/javascript">
+$(document).ready(function(){
+	$('select').selectpicker();
+
+	$("#yyyymmdd_from, #yyyymmdd_to").datepicker({
+		dateFormat : "yy.mm.dd",
+		showOn : "both",
+		maxDate: 0,
+		buttonImageOnly : true,
+		buttonImage : "/cube_bta/lib/tpms/images/icon_cal.gif",
+		buttonText : "Calendar",
+		onSelect: function (dateText, inst) {
+			loadRunTimeList();
+		}
+	});
+
+	/* 프로젝트 변경 시 : Key Task 목록 재조회 */
+	$("#srchPjtNo").on("change", function(){
+		loadKeyTaskList();
+	});
+
+	/* Key Task 변경 시 : 하위 관리항목 목록 재조회 */
+	$("#srchPriSeq").on("change", function(){
+		loadItemList();
+	});
+
+	$('button.pageMenuButton').click(function() {
+		var action = $(this).data('action');
+		switch (action) {
+			case "excelDown":
+				pageParams.excelDownload();
+				break;
+		}
+	});
+
+	/* 초기 콤보 로드 */
+	loadRunTimeList();
+	loadKeyTaskList();
+
+	var page_params = function() {
+		/* excel data setting */
+		this.getExcelParams = function() {
+			var paramStr = "";
+			paramStr += "srch_pjt_no=" + $("#srchPjtNo").val() + "&";
+			paramStr += "srch_displn_cd=" + $("#srchDisplnCd").val() + "&";
+			paramStr += "srch_from_dt=" + $("#yyyymmdd_from").val() + "&";
+			paramStr += "srch_to_dt=" + $("#yyyymmdd_to").val() + "&";
+			paramStr += "srch_run_key=" + $("#srchRunKey").val() + "&";
+			paramStr += "srch_pri_seq=" + $("#srchPriSeq").val() + "&";
+			paramStr += "srch_pri_dtl_seq=" + $("#srchPriDtlSeq").val() + "&";
+			paramStr += "srch_mail_type=" + $("#srchMailType").val() + "&";
+			paramStr += "srch_rcvr_gbn=" + $("#srchRcvrGbn").val() + "&";
+			paramStr += "srch_send_yn=" + $("#srchSendYn").val() + "&";
+			paramStr += "srch_rcvr=" + encodeURIComponent($("#srchRcvr").val()) + "&";
+			paramStr += "excel_nm=" + encodeURIComponent($("#title").text()) + "&";
+
+			return paramStr.substring(0, paramStr.length - 1);
+		}
+		/* 엑셀받기 */
+		this.excelDownload = function() {
+			tpmsCommon.goLocationPage("/cube_bta/tpmswork/ep/eep/keyTaskMailing/keyTaskLogExcel", this.getExcelParams());
+		}
+	};
+
+	var pageParams = new page_params();
+	window.pageParams = pageParams;
+
+	$("#listTable").DataTable({
+		"autoWidth": false,
+		"searching": false,
+		"language" : { "info" : "Total : _MAX_", "infoEmpty": "Total : 0" },
+		"info": true,
+		"paging": false,
+		"ordering": false,
+		"serverSide": false,
+		"processing": true,
+		"ajax": {
+			"type": "POST",
+			"url": "/cube_bta/tpmswork/ep/eep/keyTaskMailing/selectKeyTaskLogList",
+			"data": function() {
+				var params = {
+					"srch_pjt_no": $("#srchPjtNo").val()
+					, "srch_displn_cd": $("#srchDisplnCd").val()
+					, "srch_from_dt": $("#yyyymmdd_from").val()
+					, "srch_to_dt": $("#yyyymmdd_to").val()
+					, "srch_run_key": $("#srchRunKey").val()
+					, "srch_pri_seq": $("#srchPriSeq").val()
+					, "srch_pri_dtl_seq": $("#srchPriDtlSeq").val()
+					, "srch_mail_type": $("#srchMailType").val()
+					, "srch_rcvr_gbn": $("#srchRcvrGbn").val()
+					, "srch_send_yn": $("#srchSendYn").val()
+					, "srch_rcvr": $("#srchRcvr").val()
+				};
+				return JSON.stringify(params);
+			},
+			"contentType": "application/json+lego; charset=UTF-8",
+			"dataSrc": function(json) {
+				return json.list;
+			}
+		},
+		"columns": [
+			{ "data": "batch_dt_nm", "className": "text-center" }
+			, { "data": "run_tm", "className": "text-center" }
+			, {
+				"data": "rcvr_nm", "className": "text-center",
+				"render": function(data, type, row) {
+					var nm = data != null ? data : "";
+					return nm + " (" + (row.rcvr_empno != null ? row.rcvr_empno : "") + ")";
+				}
+			}
+			, { "data": "rcvr_gbn_nm", "className": "text-center" }
+			, { "data": "rcvr_dept_nm", "className": "text-center" }
+			, { "data": "rcvr_displn_nm", "className": "text-center" }
+			, { "data": "mail_type_nm", "className": "text-center" }
+			, {
+				"data": "pjt_nms", "className": "text-center",
+				"render": function(data, type, row) {
+					var v = data != null ? data : "";
+					return '<span title="' + v + '">' + v + '</span>';
+				}
+			}
+			, { "data": "item_cnt", "className": "text-center" }
+			, { "data": "action_cnt_nm", "className": "text-center" }
+			, {
+				"data": "mail_title", "className": "text-left",
+				"render": function(data, type, row) {
+					var v = data != null ? data : "";
+					return '<span title="' + v + '">' + v + '</span>';
+				}
+			}
+			, {
+				"data": "send_yn", "className": "text-center",
+				"render": function(data, type, row) {
+					if (data == 'Y') {
+						return '<span class="badge-send-y">Y</span>';
+					}
+					return '<span class="badge-send-n">N</span>';
+				}
+			}
+		],
+		"createdRow": function(row, data, dataIndex) {
+			$(row).css("cursor", "pointer");
+			$(row).on("click", function() {
+				openDtlModal(data.log_seq);
+			});
+		}
+	});
+});
+
+/* 목록 재조회 */
+function searchList() {
+	$("#listTable").DataTable().ajax.reload();
 }
 
+/* 실행시각 콤보 로드 */
+function loadRunTimeList() {
+	var params = {
+		"srch_from_dt": $("#yyyymmdd_from").val()
+		, "srch_to_dt": $("#yyyymmdd_to").val()
+	};
 
+	$.ajax({
+		type: "POST",
+		url: "/cube_bta/tpmswork/ep/eep/keyTaskMailing/selectKeyTaskLogRunTimeList",
+		contentType: "application/json+lego; charset=UTF-8",
+		data: JSON.stringify(params),
+		success: function(json) {
+			var html = '<option value="">전체</option>';
+			var list = json.list;
+			if (list != null) {
+				for (var i = 0; i < list.length; i++) {
+					html += '<option value="' + list[i].run_key + '">' + list[i].run_nm + '</option>';
+				}
+			}
+			$("#srchRunKey").html(html);
+			$("#srchRunKey").selectpicker("refresh");
+		}
+	});
+}
 
+/* Key Task 콤보 로드 */
+function loadKeyTaskList() {
+	var params = { "srch_pjt_no": $("#srchPjtNo").val() };
 
+	$.ajax({
+		type: "POST",
+		url: "/cube_bta/tpmswork/ep/eep/keyTaskMailing/selectKeyTaskLogTaskList",
+		contentType: "application/json+lego; charset=UTF-8",
+		data: JSON.stringify(params),
+		success: function(json) {
+			var html = '<option value="">전체</option>';
+			var list = json.list;
+			if (list != null) {
+				for (var i = 0; i < list.length; i++) {
+					html += '<option value="' + list[i].pri_seq + '">' + list[i].pri_mng_item_nm + '</option>';
+				}
+			}
+			$("#srchPriSeq").html(html);
+			$("#srchPriSeq").selectpicker("refresh");
 
-<!-- 알림 발송 로그 마스터 INSERT (LOG_SEQ는 MAX+1 채번) -->
-	<insert id="insertEepPriNotiLog" parameterType="java.util.Map">
-	/* legacy-eep-mailing-mybatis.xml insertEepPriNotiLog */
-		<selectKey keyProperty="logSeq" resultType="java.lang.Long" order="BEFORE">
-			SELECT NVL(MAX(LOG_SEQ), 0) + 1
-			  FROM SEI_BK.BTA_EP_E_PRI_NOTI_LOG
-		</selectKey>
-		INSERT INTO SEI_BK.BTA_EP_E_PRI_NOTI_LOG (
-			LOG_SEQ
-			, BATCH_DT
-			, RCVR_EMPNO
-			, RCVR_NM
-			, RCVR_GBN
-			, RCVR_DEPT_NM
-			, RCVR_DISPLN_CD
-			, RCVR_DISPLN_NM
-			, MAIL_TYPE
-			, MAIL_LANG
-			, PJT_CNT
-			, ITEM_CNT
-			, IMMD_CNT
-			, RCVY_CNT
-			, ERLY_CNT
-			, MAIL_TITLE
-			, MAIL_BODY
-			, SEND_YN
-			, SEND_DT
-			, REG_DATE
-		) VALUES (
-			#{logSeq}
-			, #{batchDt}
-			, #{rcvrEmpno}
-			, #{rcvrNm}
-			, #{rcvrGbn}
-			, #{rcvrDeptNm}
-			, #{rcvrDisplnCd}
-			, #{rcvrDisplnNm}
-			, #{mailType}
-			, #{mailLang}
-			, #{pjtCnt}
-			, #{itemCnt}
-			, #{immdCnt}
-			, #{rcvyCnt}
-			, #{erlyCnt}
-			, #{mailTitle}
-			, #{mailBody}
-			, 'N'				<!-- 검증 단계에서는 미발송 -->
-			, NULL
-			, TO_CHAR(SYSDATE, 'YYYYMMDDHH24MISS')
-		)
-	</insert>
+			/* Key Task가 초기화되었으므로 하위 관리항목도 다시 로드 */
+			loadItemList();
+		}
+	});
+}
 
+/* 하위 관리항목 콤보 로드 */
+function loadItemList() {
+	var params = {
+		"srch_pjt_no": $("#srchPjtNo").val()
+		, "srch_pri_seq": $("#srchPriSeq").val()
+	};
 
+	$.ajax({
+		type: "POST",
+		url: "/cube_bta/tpmswork/ep/eep/keyTaskMailing/selectKeyTaskLogItemList",
+		contentType: "application/json+lego; charset=UTF-8",
+		data: JSON.stringify(params),
+		success: function(json) {
+			var html = '<option value="">전체</option>';
+			var list = json.list;
+			if (list != null) {
+				for (var i = 0; i < list.length; i++) {
+					html += '<option value="' + list[i].pri_dtl_seq + '">' + list[i].pri_mng_item_sub_nm + '</option>';
+				}
+			}
+			$("#srchPriDtlSeq").html(html);
+			$("#srchPriDtlSeq").selectpicker("refresh");
+		}
+	});
+}
 
+/* 상세 모달 오픈 */
+function openDtlModal(logSeq) {
+	var params = { "log_seq": logSeq };
 
-<!-- 알림 발송 로그 상세 INSERT (메일 표에 들어간 항목) -->
-	<insert id="insertEepPriNotiLogDtl" parameterType="java.util.Map">
-	/* legacy-eep-mailing-mybatis.xml insertEepPriNotiLogDtl */
-		INSERT INTO SEI_BK.BTA_EP_E_PRI_NOTI_LOG_DTL (
-			LOG_SEQ
-			, ITEM_NO
-			, PJT_NO
-			, V_ORDER
-			, PRI_SEQ
-			, MNG_ITEM_NO
-			, PRI_MNG_ITEM_NM
-			, MST_DISPLN_CD
-			, MST_DISPLN_NM
-			, PRI_DTL_SEQ
-			, DTL_MNG_ITEM_NO
-			, PRI_MNG_ITEM_SUB_NM
-			, MAJ_DISPLN_CD
-			, DISPLN_NM
-			, OWNER_GBN
-			, PLAN_DT
-			, WEEKS_BEFORE
-			, VER
-			, DSN_COMP
-			, COMP_LIMIT
-			, ACTION_LVL
-			, STAGE_NM
-			, STATUS_NM
-			, ACTION_NM
-			, REG_DATE
-		) VALUES (
-			#{logSeq}
-			, #{itemNo}
-			, #{pjtNo}
-			, #{vOrder}
-			, #{priSeq}
-			, #{mngItemNo}
-			, #{priMngItemNm}
-			, #{mstDisplnCd}
-			, #{mstDisplnNm}
-			, #{priDtlSeq}
-			, #{dtlMngItemNo}
-			, #{priMngItemSubNm}
-			, #{majDisplnCd}
-			, #{displnNm}
-			, #{ownerGbn}
-			, #{planDt}
-			, #{weeksBefore}
-			, #{ver}
-			, #{dsnComp}
-			, #{compLimit}
-			, #{actionLvl}
-			, #{stageNm}
-			, #{statusNm}
-			, #{actionNm}
-			, TO_CHAR(SYSDATE, 'YYYYMMDDHH24MISS')
-		)
-	</insert>
+	$.ajax({
+		type: "POST",
+		url: "/cube_bta/tpmswork/ep/eep/keyTaskMailing/selectKeyTaskLogDtlList",
+		contentType: "application/json+lego; charset=UTF-8",
+		data: JSON.stringify(params),
+		success: function(json) {
+			var info = json.info;
+			var list = json.list;
 
+			/* 요약 정보 */
+			var infoHtml = '';
+			infoHtml += '<div><span class="lbl">수신자</span>' + nvl(info.rcvr_nm) + ' (' + nvl(info.rcvr_empno) + ') / ' + nvl(info.rcvr_dept_nm) + ' / ' + nvl(info.rcvr_displn_nm) + '</div>';
+			infoHtml += '<div><span class="lbl">메일유형</span>' + nvl(info.mail_type_nm)
+					  + ' &nbsp;|&nbsp; 총 ' + nvl(info.item_cnt) + '건'
+					  + ' (즉시 ' + nvl(info.immd_cnt) + ' / 만회 ' + nvl(info.rcvy_cnt) + ' / 조기 ' + nvl(info.erly_cnt) + ')</div>';
+			infoHtml += '<div><span class="lbl">제목</span>' + nvl(info.mail_title) + '</div>';
+			$("#dtlInfoBox").html(infoHtml);
 
+			/* 상세 항목 표 */
+			var tbody = '';
+			if (list != null) {
+				for (var i = 0; i < list.length; i++) {
+					var d = list[i];
+					tbody += '<tr>';
+					tbody += '<td class="dtl-c">' + nvl(d.item_no) + '</td>';
+					tbody += '<td class="dtl-c">' + nvl(d.v_order) + '</td>';
+					tbody += '<td class="dtl-c">' + nvl(d.owner_gbn_nm) + '</td>';
+					tbody += '<td>' + nvl(d.view_nm) + '</td>';
+					tbody += '<td>' + nvl(d.view_keytask_nm) + '</td>';
+					tbody += '<td class="dtl-c">' + nvl(d.view_displn_nm) + '</td>';
+					tbody += '<td class="dtl-c">' + nvl(d.plan_dt_nm) + '</td>';
+					tbody += '<td class="dtl-c">' + nvl(d.stage_nm) + '</td>';
+					tbody += '<td class="dtl-c">' + nvl(d.dsn_comp) + '</td>';
+					tbody += '<td class="dtl-c">' + nvl(d.comp_limit) + '</td>';
+					tbody += '<td>' + nvl(d.status_nm) + '</td>';
+					tbody += '<td>' + nvl(d.action_nm) + '</td>';
+					tbody += '</tr>';
+				}
+			}
+			$("#dtlTableBody").html(tbody);
 
--- 메일 몇 통, 유형별로 어떻게 나왔나
-SELECT MAIL_TYPE, COUNT(*) CNT, SUM(ITEM_CNT) ITEMS
-  FROM SEI_BK.BTA_EP_E_PRI_NOTI_LOG
- WHERE BATCH_DT = TO_CHAR(SYSDATE,'YYYYMMDD')
- GROUP BY MAIL_TYPE;
+			/* 메일 본문 미리보기 (iframe 으로 격리하여 화면 CSS 영향 제거) */
+			var preview = document.getElementById("mailPreview");
+			var doc = preview.contentDocument || preview.contentWindow.document;
+			doc.open();
+			doc.write('<html><head><meta charset="UTF-8"></head><body style="margin:0;">');
+			doc.write(info.mail_body != null ? info.mail_body : '(본문 없음)');
+			doc.write('</body></html>');
+			doc.close();
 
--- 본문 짤린 건 있나
-SELECT LOG_SEQ, RCVR_NM, MAIL_TYPE, ITEM_CNT, LENGTHB(MAIL_BODY) BODY_BYTES
-  FROM SEI_BK.BTA_EP_E_PRI_NOTI_LOG
- WHERE BATCH_DT = TO_CHAR(SYSDATE,'YYYYMMDD')
- ORDER BY BODY_BYTES DESC;
+			/* 첫번째 탭 활성화 후 모달 오픈 */
+			$('#dtlTab a[href="#tabItem"]').tab('show');
+			$("#logDtlModal").modal("show");
+		}
+	});
+}
 
+function nvl(v) {
+	return (v == null || v == "null") ? "" : v;
+}
+</script>
